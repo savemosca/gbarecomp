@@ -255,6 +255,7 @@ struct RuntimeUiContext {
     int pending_save_slot = 0;
     int pending_load_slot = 0;
     bool pending_rewind = false;
+    bool pending_quit = false;
     bool assist_tools_exposed = false;
     bool assist_tools_enabled = true;
     bool fast_forward_latched = false;
@@ -351,6 +352,11 @@ int runtime_ui_action(void* opaque, const RecompRuntimeUiItem* item) {
     }
     if (std::strcmp(item->key, GBARECOMP_UI_KEY_REWIND) == 0) {
         c->pending_rewind = true;
+        recomp_runtime_ui_close(c->ui);
+        return 1;
+    }
+    if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_QUIT) == 0) {
+        c->pending_quit = true;
         recomp_runtime_ui_close(c->ui);
         return 1;
     }
@@ -3006,6 +3012,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         runtime_ui_config.features |=
             RECOMP_RUNTIME_UI_STANDARD_FULLSCREEN |
             RECOMP_RUNTIME_UI_STANDARD_WINDOW_SCALE;
+#else
+        // A mobile game has no window to close and the system Back button is
+        // routed to the game, so the menu is the only clean way out: it ends
+        // the session (save flushed, no suspend state) and the Activity
+        // finishes, returning to whatever started it.
+        runtime_ui_config.features |= RECOMP_RUNTIME_UI_STANDARD_QUIT;
 #endif
         runtime_ui_config.view_modes = RECOMP_RUNTIME_UI_VIEW_MODE_NATIVE;
         if (opts.launcher_expose_widescreen && opts.max_view_width > 240)
@@ -3577,6 +3589,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         if (runtime_ui_context.pending_load_slot) {
             ev.load_slot = runtime_ui_context.pending_load_slot;
             runtime_ui_context.pending_load_slot = 0;
+        }
+        if (runtime_ui_context.pending_quit) {
+            runtime_ui_context.pending_quit = false;
+            host_quit = true;
         }
 #endif
         if (opts.expose_assist_tools && !assist_tools_enabled()) {
