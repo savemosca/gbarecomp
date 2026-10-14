@@ -412,6 +412,20 @@ struct Backend {
     uint64_t      audio_direct_pushes = 0;
     uint64_t      audio_direct_samples = 0;
     uint64_t      audio_direct_underruns = 0;
+    // Session health: one clock read per present, summarised in the log when
+    // the app goes to the background (it may be killed there) and on close.
+    uint64_t      health_frames = 0;
+    uint64_t      health_late = 0;      // present gap > 25 ms: a frame missed
+    uint64_t      health_hitches = 0;   // present gap > 100 ms: a visible stall
+    uint64_t      health_max_gap_us = 0;
+    Uint64        health_prev_present = 0;
+    // Audio bridge counters (output frames played dry, source frames dropped
+    // on overflow), accumulated only across steady play: the bridge also runs
+    // dry at start-up and while a state is written before the background.
+    uint64_t      health_seen_underrun = 0;
+    uint64_t      health_seen_overflow = 0;
+    uint64_t      health_play_underrun = 0;
+    uint64_t      health_play_overflow = 0;
     uint64_t      audio_direct_probe_samples = 0;
     uint64_t      audio_direct_probe_nonzero = 0;
     long double   audio_direct_probe_square_sum = 0.0;
@@ -2100,11 +2114,58 @@ void HostWindow::set_title(const char* title) {
     SDL_SetWindowTitle(b->window,title);
 }
 
+static void note_present_for_health(Backend* b) {
+    const Uint64 now = SDL_GetPerformanceCounter();
+    uint64_t gap_us = UINT64_MAX;
+    if (b->health_prev_present) {
+        gap_us = (now - b->health_prev_present) * 1000000ull /
+                 SDL_GetPerformanceFrequency();
+        // Longer gaps are pauses (menus, state loads), not stutter.
+        if (gap_us < 2000000ull) {
+            if (gap_us > 25000ull) ++b->health_late;
+            if (gap_us > 100000ull) ++b->health_hitches;
+            b->health_max_gap_us = std::max(b->health_max_gap_us, gap_us);
+        }
+    }
+    if (b->bridge_ready) {
+        rab_stats st;
+        rab_get_stats(&b->bridge, &st);  // plain copy; counters only grow
+        if (gap_us <= 100000ull) {
+            b->health_play_underrun += st.underrun_events - b->health_seen_underrun;
+            b->health_play_overflow += st.overflow_drops - b->health_seen_overflow;
+        }
+        b->health_seen_underrun = st.underrun_events;
+        b->health_seen_overflow = st.overflow_drops;
+    }
+    b->health_prev_present = now;
+    ++b->health_frames;
+}
+
+static void log_session_health(Backend* b, const char* when) {
+    // Milliseconds of output played from an empty bridge, and of guest audio
+    // dropped because the bridge was full, during steady play.
+    double dry_ms = 0.0, dropped_ms = 0.0;
+    if (b->bridge_ready) {
+        dry_ms = b->health_play_underrun * 1000.0 / b->bridge.cfg.host_rate;
+        dropped_ms = b->health_play_overflow * 1000.0 / b->bridge.cfg.source_rate;
+    }
+    std::fprintf(stderr,
+                 "host_window: session_health (%s) frames=%llu late_frames=%llu "
+                 "hitches=%llu max_gap_ms=%.1f audio_dry_ms=%.1f "
+                 "audio_dropped_ms=%.1f\n",
+                 when, static_cast<unsigned long long>(b->health_frames),
+                 static_cast<unsigned long long>(b->health_late),
+                 static_cast<unsigned long long>(b->health_hitches),
+                 b->health_max_gap_us / 1000.0, dry_ms, dropped_ms);
+    std::fflush(stderr);
+}
+
 void HostWindow::close() {
     if (!impl_) { open_ = false; return; }
     auto* b = static_cast<Backend*>(impl_);
     b->cadence.dump();  // MC-WS-002: flush the cadence ring (verbose only)
     if (b->audio_dev) SDL_CloseAudioDevice(b->audio_dev);  // stops the callback first
+    log_session_health(b, "exit");
     if (b->bridge_ready) rab_free(&b->bridge);
     if (b->audio_mtx) SDL_DestroyMutex(b->audio_mtx);
     close_game_controller(b);
@@ -2188,6 +2249,7 @@ bool HostWindow::drawable_size(int* width, int* height) const {
 void HostWindow::present(const uint8_t* rgb888) {
     if (!open_ || !impl_ || !rgb888) return;
     auto* b = static_cast<Backend*>(impl_);
+    note_present_for_health(b);
     // Present-time color grading (opt-in). Raw is passthrough: the raw
     // PPU frame is uploaded untouched, so verify/frame-hash are unaffected.
     if (b->color_lut && !b->color_lut->is_passthrough() &&
@@ -2621,7 +2683,7 @@ bool HostWindow::wait_for_foreground() {
     if (!open_ || !impl_) return false;
     auto* b = static_cast<Backend*>(impl_);
     std::fprintf(stderr, "host_window: background — emulation suspended\n");
-    std::fflush(stderr);
+    log_session_health(b, "background");
     if (b->audio_dev) SDL_PauseAudioDevice(b->audio_dev, 1);
     TouchHub::instance().cancel_all(touch_clock_ms());
     clear_touches(b);
@@ -2635,6 +2697,7 @@ bool HostWindow::wait_for_foreground() {
         }
     }
     b->backgrounded = false;
+    b->health_prev_present = 0;  // the time away is not a stall
     if (resumed && b->audio_dev) {
         if (b->audio_direct) {
             // Rebuild the cushion rather than replaying a stale queue.
