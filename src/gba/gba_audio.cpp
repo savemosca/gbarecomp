@@ -4,6 +4,7 @@
 #include "gba_audio.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
@@ -1006,6 +1007,36 @@ void GbaAudio::log_shadow_summary(const char* when) const {
                  static_cast<unsigned long long>(shadow_.bad_waves()));
 }
 
+int16_t GbaAudio::psg_low_pass(int16_t in) {
+    PsgLowPass& f = psg_lp_;
+    const uint32_t rate = sample_rate();
+    if (f.rate != rate) {
+        constexpr float kCutoffHz = 8000.0f;
+        constexpr float kQ = 0.70710678f;
+        const float w0 = 6.28318530f * kCutoffHz / static_cast<float>(rate);
+        const float alpha = std::sin(w0) / (2.0f * kQ);
+        const float cw = std::cos(w0);
+        const float a0 = 1.0f + alpha;
+        f.b0 = (1.0f - cw) * 0.5f / a0;
+        f.b1 = (1.0f - cw) / a0;
+        f.b2 = f.b0;
+        f.a1 = -2.0f * cw / a0;
+        f.a2 = (1.0f - alpha) / a0;
+        f.rate = rate;
+        f.primed = false;
+    }
+    const float x = static_cast<float>(in);
+    if (!f.primed) {
+        // Start at the current level: no step when substitution begins.
+        f.x1 = f.x2 = f.y1 = f.y2 = x;
+        f.primed = true;
+    }
+    const float y = f.b0 * x + f.b1 * f.x1 + f.b2 * f.x2 - f.a1 * f.y1 - f.a2 * f.y2;
+    f.x2 = f.x1; f.x1 = x;
+    f.y2 = f.y1; f.y1 = y;
+    return static_cast<int16_t>(std::lround(std::clamp(y, -32767.0f, 32767.0f)));
+}
+
 void GbaAudio::mix_slot(uint32_t slot) {
     bool substitute = false;
     float sl = 0.0f, sr = 0.0f;
@@ -1027,6 +1058,13 @@ void GbaAudio::mix_slot(uint32_t slot) {
     ChannelTap tap;
     int16_t s = mix_one_sample(slot, /*include_direct=*/!substitute, &tap);
     if (substitute) {
+        // The PSG channels are synthesized with ideal hard edges. Under the
+        // canon mix the FIFO's 8-bit sample-and-hold at the driver rate
+        // masks them; next to the clean shadow they are heard as crackle
+        // (MOTHER 3's noise-channel percussion). Smooth them like a
+        // device's output stage would: 2nd-order Butterworth at 8 kHz.
+        s = psg_low_pass(s);
+
         // The shadow's right/left are MP2K's FIFO A/B streams in the bus
         // float domain (full-scale DAC = 0.25, i.e. 128 in s8 units).
         // Route and scale them exactly as mix_one_sample does the FIFO
@@ -1048,6 +1086,8 @@ void GbaAudio::mix_slot(uint32_t slot) {
         if (o > 32767) o = 32767;
         if (o < -32767) o = -32767;
         s = static_cast<int16_t>(o);
+    } else {
+        psg_lp_.primed = false;
     }
     current_samples_[slot] = s;
     current_sample_rates_[slot] = 1 + ((soundbias_ >> 14) & 3);

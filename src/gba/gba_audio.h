@@ -325,6 +325,14 @@ private:
     int16_t current_samples_[kMaxSamplesPerEvent] = {};
     uint8_t current_sample_rates_[kMaxSamplesPerEvent] = {};
     CapSample current_caps_[kMaxSamplesPerEvent] = {};
+    // 2nd-order Butterworth low-pass (8 kHz) on the PSG part while the MP2K
+    // shadow substitutes; see mix_slot().
+    struct PsgLowPass {
+        uint32_t rate = 0;
+        float b0 = 0, b1 = 0, b2 = 0, a1 = 0, a2 = 0;
+        float x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+        bool  primed = false;
+    } psg_lp_;
     uint32_t sample_index_ = 0;
     std::vector<FifoTrace> trace_;
     uint32_t trace_write_ = 0;
@@ -343,6 +351,7 @@ private:
     // MP2K shadow while it substitutes. The single place both the event and
     // the mid-event catch-up (sample_until_current_time) produce samples.
     void mix_slot(uint32_t slot);
+    int16_t psg_low_pass(int16_t in);
     void run_sample_event();
     void ch1_trigger();
     void ch2_trigger();
