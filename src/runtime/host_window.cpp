@@ -419,6 +419,15 @@ struct Backend {
     uint64_t      health_hitches = 0;   // present gap > 100 ms: a visible stall
     uint64_t      health_max_gap_us = 0;
     Uint64        health_prev_present = 0;
+    Uint64        health_first_present = 0;
+    unsigned      health_hitch_lines = 0;  // capped, see note_present_for_health
+    // The latest present gap, counted at the next present. Android delays
+    // the last present before the app leaves the foreground (about 525 ms
+    // on the RG556 when Home is pressed); that gap is the system's
+    // transition, so it is dropped when the session is suspended or ends.
+    uint64_t      health_pending_gap_us = 0;
+    uint64_t      health_pending_frame = 0;
+    Uint64        health_pending_at = 0;
     // Audio bridge counters (output frames played dry, source frames dropped
     // on overflow), accumulated only across steady play: the bridge also runs
     // dry at start-up and while a state is written before the background.
@@ -2114,19 +2123,46 @@ void HostWindow::set_title(const char* title) {
     SDL_SetWindowTitle(b->window,title);
 }
 
+static void commit_pending_gap(Backend* b) {
+    const uint64_t gap_us = b->health_pending_gap_us;
+    if (!gap_us) return;
+    b->health_pending_gap_us = 0;
+    if (gap_us > 25000ull) ++b->health_late;
+    if (gap_us > 100000ull) {
+        ++b->health_hitches;
+        // Where it happened, so it can be matched with what the player was
+        // doing; rare by definition, capped regardless.
+        if (b->health_hitch_lines < 20) {
+            ++b->health_hitch_lines;
+            std::fprintf(stderr,
+                         "host_window: hitch %.1f ms at frame %llu, "
+                         "%.1f s into the session\n",
+                         gap_us / 1000.0,
+                         static_cast<unsigned long long>(b->health_pending_frame),
+                         static_cast<double>(b->health_pending_at - b->health_first_present) /
+                             SDL_GetPerformanceFrequency());
+        }
+    }
+    b->health_max_gap_us = std::max(b->health_max_gap_us, gap_us);
+}
+
 static void note_present_for_health(Backend* b) {
     const Uint64 now = SDL_GetPerformanceCounter();
+    // Another present came, so the previous gap did not lead out of the
+    // foreground: count it.
+    commit_pending_gap(b);
     uint64_t gap_us = UINT64_MAX;
     if (b->health_prev_present) {
         gap_us = (now - b->health_prev_present) * 1000000ull /
                  SDL_GetPerformanceFrequency();
         // Longer gaps are pauses (menus, state loads), not stutter.
         if (gap_us < 2000000ull) {
-            if (gap_us > 25000ull) ++b->health_late;
-            if (gap_us > 100000ull) ++b->health_hitches;
-            b->health_max_gap_us = std::max(b->health_max_gap_us, gap_us);
+            b->health_pending_gap_us = gap_us;
+            b->health_pending_frame = b->health_frames;
+            b->health_pending_at = now;
         }
     }
+    if (!b->health_first_present) b->health_first_present = now;
     if (b->bridge_ready) {
         rab_stats st;
         rab_get_stats(&b->bridge, &st);  // plain copy; counters only grow
@@ -2142,6 +2178,15 @@ static void note_present_for_health(Backend* b) {
 }
 
 static void log_session_health(Backend* b, const char* when) {
+    // The gap before the last present led out of the foreground (or to the
+    // end): the system's transition, not the game's.
+    if (b->health_pending_gap_us > 100000ull) {
+        std::fprintf(stderr,
+                     "host_window: %.1f ms before the last frame (%s), "
+                     "not counted\n",
+                     b->health_pending_gap_us / 1000.0, when);
+    }
+    b->health_pending_gap_us = 0;
     // Milliseconds of output played from an empty bridge, and of guest audio
     // dropped because the bridge was full, during steady play.
     double dry_ms = 0.0, dropped_ms = 0.0;
