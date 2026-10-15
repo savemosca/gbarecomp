@@ -165,6 +165,14 @@ public:
     // that has to prove itself again; switching off returns to the canon
     // mix at once. No effect when the ROM does not link MP2K.
     void set_shadow_enabled(bool on);
+    // Entry PCs (Thumb bit clear) of the detected SoundMainRAM copies; the
+    // runtime calls shadow_driver_tick() when guest code dispatches to one.
+    std::size_t shadow_hook_pcs(uint32_t* out, std::size_t max) const;
+    // One MP2K driver tick: SoundMain has updated the channels and is about
+    // to mix. The shadow re-reads the channel state here.
+    void shadow_driver_tick(uint32_t pc, bool thumb);
+    // One log line: how long the shadow substituted, ticks seen, reverts.
+    void log_shadow_summary(const char* when) const;
 
     // Save-state serialization. Captures the full guest mixer state
     // (channels, FIFOs, master, soundbias, sample accumulator) plus the
@@ -353,8 +361,8 @@ private:
     MemView    shadow_mem_{};
     bool       shadow_enabled_ = false;
     uint64_t   shadow_cursor_ = 0;          // running grid-sample count
-    uint32_t   shadow_samples_since_hook_ = 0;
-    uint32_t   shadow_hook_period_ = 1097;  // ≈ output samples per 59.7 Hz tick
+    uint64_t   shadow_enabled_samples_ = 0;  // samples rendered while enabled
+    uint64_t   shadow_live_samples_ = 0;     // ... of which substituted
 };
 
 }  // namespace gba

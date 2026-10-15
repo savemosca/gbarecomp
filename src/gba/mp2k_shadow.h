@@ -65,6 +65,13 @@ public:
 
     uint32_t hook_key0() const { return hook_n_ ? hook_keys_[0] : 0; }
 
+    // Diagnostics: driver ticks seen, ticks whose SoundInfo was not live,
+    // waves the shadow cannot model, and verifier reverts.
+    uint64_t hooks() const { return hooks_; }
+    uint64_t stale_ticks() const { return stale_ticks_; }
+    uint64_t bad_waves() const { return bad_waves_; }
+    uint64_t pauses() const { return vf_.pauses(); }
+
 private:
     struct Voice {
         bool     on = false;

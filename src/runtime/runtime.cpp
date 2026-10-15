@@ -1797,6 +1797,18 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                               (se && se[0] && se[0] != '0'));
     }
     bus.set_rom(rom.data(), rom.size());
+    // The MP2K audio shadow re-reads the driver's channels once per tick, at
+    // the mixer's entry (SoundMainRAM), which guest code reaches through
+    // dispatch. Observing only; nothing is installed when the ROM has no MP2K.
+    g_runtime_observed_pc_count = static_cast<unsigned>(
+        bus.audio().shadow_hook_pcs(g_runtime_observed_pcs,
+                                    RUNTIME_MAX_OBSERVED_PCS));
+    g_runtime_dispatch_observer = g_runtime_observed_pc_count
+        ? [](uint32_t pc, int thumb) {
+              if (gba::GbaBus* b = gbarecomp::active_bus())
+                  b->audio().shadow_driver_tick(pc, thumb != 0);
+          }
+        : nullptr;
     if (!args.quiet && bus.matrix().active()) {
         std::printf(
             "matrix_mapper=active physical_size=%zu aperture=%zu page_size=%zu\n",
@@ -3506,6 +3518,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             // persist the cartridge save, a suspend state and the session's
             // diagnostic rings now.
             const bool saved = flush_save_notify();
+            bus.audio().log_shadow_summary(ev.terminating ? "terminating" : "background");
             write_session_diagnostics(opts, ev.terminating ? "terminating" : "background",
                                       ppu.frame_count());
             std::string e;
@@ -4345,6 +4358,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     // Through the wrapper: the web notice does not depend on HostWindow, so
     // running after win.close() is fine.
     bool save_ok = flush_save_notify();
+    bus.audio().log_shadow_summary("exit");
     if (!suspend_on_exit) clear_suspend_marker();
     if (args.window && args.frames >= 0) {
         std::printf("bounded_window start_frame=%llu end_frame=%llu presented=%llu "

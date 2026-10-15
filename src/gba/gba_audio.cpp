@@ -947,9 +947,6 @@ void GbaAudio::configure_shadow(const std::vector<Mp2kSig>& sigs,
     shadow_sigs_ = sigs;
     shadow_.init(sigs);
     shadow_cursor_ = 0;
-    shadow_samples_since_hook_ = 0;
-    shadow_hook_period_ = sample_rate() / 60u;
-    if (shadow_hook_period_ == 0) shadow_hook_period_ = 1097u;
     // Opt-in. `enable_request` is the per-game default ([audio].shadow in
     // game.toml); GBARECOMP_AUDIO_SHADOW overrides it ("0" forces off, any
     // other value forces on). Only takes effect if the ROM links MP2K.
@@ -970,11 +967,44 @@ void GbaAudio::set_shadow_enabled(bool on) {
         shadow_ = Mp2kShadow{};  // voices and verifier start over
         shadow_.init(shadow_sigs_);
         shadow_cursor_ = 0;
-        shadow_samples_since_hook_ = 0;
     }
     shadow_enabled_ = on;
     std::fprintf(stderr, "[audio] MP2K shadow mixer %s by the player\n",
                  on ? "ARMED" : "off");
+}
+
+std::size_t GbaAudio::shadow_hook_pcs(uint32_t* out, std::size_t max) const {
+    if (!shadow_.armed()) return 0;
+    std::size_t n = 0;
+    for (const auto& sig : shadow_sigs_) {
+        if (n == max) break;
+        out[n++] = sig.sound_main_ram & ~1u;
+    }
+    return n;
+}
+
+void GbaAudio::shadow_driver_tick(uint32_t pc, bool thumb) {
+    // Each tick, at its exact point: a fixed-rate poll drifts against the
+    // driver's VBlank cadence and mostly finds SoundInfo idle (not 'Smsh'+1),
+    // or past the mixer's note-on processing.
+    if (!shadow_enabled_) return;
+    shadow_.frame_hook(shadow_mem_, shadow_cursor_, thumb ? (pc | 1u) : pc);
+}
+
+void GbaAudio::log_shadow_summary(const char* when) const {
+    if (!shadow_.armed() || shadow_enabled_samples_ == 0) return;
+    const double rate = sample_rate() ? sample_rate() : 65536.0;
+    std::fprintf(stderr,
+                 "[audio] MP2K shadow (%s): live %.1f%% of %.1f s, driver ticks "
+                 "%llu (stale %llu), reverts %llu, unsupported waves %llu\n",
+                 when,
+                 100.0 * static_cast<double>(shadow_live_samples_) /
+                     static_cast<double>(shadow_enabled_samples_),
+                 static_cast<double>(shadow_enabled_samples_) / rate,
+                 static_cast<unsigned long long>(shadow_.hooks()),
+                 static_cast<unsigned long long>(shadow_.stale_ticks()),
+                 static_cast<unsigned long long>(shadow_.pauses()),
+                 static_cast<unsigned long long>(shadow_.bad_waves()));
 }
 
 void GbaAudio::run_sample_event() {
@@ -993,12 +1023,9 @@ void GbaAudio::run_sample_event() {
                              degraded.c_str());
             }
             ++shadow_cursor_;
-            if (++shadow_samples_since_hook_ >= shadow_hook_period_) {
-                shadow_.frame_hook(shadow_mem_, shadow_cursor_,
-                                   shadow_.hook_key0());
-                shadow_samples_since_hook_ = 0;
-            }
             substitute = shadow_.live();
+            ++shadow_enabled_samples_;
+            if (substitute) ++shadow_live_samples_;
         }
         // When the shadow is proven-live, mix PSG-only canon + the shadow's
         // direct-sound render; otherwise the full canon mix (incl. FIFO).
