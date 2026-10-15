@@ -158,6 +158,13 @@ public:
                           const uint8_t* iwram, std::size_t iwram_len,
                           bool enable_request);
     bool shadow_live() const { return shadow_enabled_ && shadow_.live(); }
+    // The ROM links MP2K, so the shadow can be switched on.
+    bool shadow_available() const { return shadow_.armed(); }
+    bool shadow_enabled() const { return shadow_enabled_; }
+    // Player toggle (in-game menu). Switching on starts from a fresh shadow
+    // that has to prove itself again; switching off returns to the canon
+    // mix at once. No effect when the ROM does not link MP2K.
+    void set_shadow_enabled(bool on);
 
     // Save-state serialization. Captures the full guest mixer state
     // (channels, FIFOs, master, soundbias, sample accumulator) plus the
@@ -342,6 +349,7 @@ private:
 
     // ── MP2K HLE shadow (verified-enhancement; default off) ──────
     Mp2kShadow shadow_{};
+    std::vector<Mp2kSig> shadow_sigs_;  // kept to re-arm on a player toggle
     MemView    shadow_mem_{};
     bool       shadow_enabled_ = false;
     uint64_t   shadow_cursor_ = 0;          // running grid-sample count

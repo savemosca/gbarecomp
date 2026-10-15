@@ -241,9 +241,11 @@ struct Args {
 #define GBARECOMP_UI_KEY_FAST_FORWARD   "assist.fast_forward"
 #define GBARECOMP_UI_KEY_FAST_FORWARD_SPEED "assist.fast_forward_speed"
 #define GBARECOMP_UI_KEY_REWIND          "assist.rewind"
+#define GBARECOMP_UI_KEY_AUDIO_ENHANCED  "audio.enhanced"
 
 struct RuntimeUiContext {
     HostWindow* window = nullptr;
+    gba::GbaAudio* audio = nullptr;
     RecompRuntimeUi* ui = nullptr;
     float* gyro_sensitivity = nullptr;
     int view_mode = RECOMP_RUNTIME_UI_VIEW_NATIVE;
@@ -274,6 +276,8 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0) *out = c->window->volume();
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_STATE_SLOT) == 0) *out = c->state_slot;
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_FPS) == 0) *out = c->window->fps_readout();
+    else if (std::strcmp(item->key, GBARECOMP_UI_KEY_AUDIO_ENHANCED) == 0 && c->audio)
+        *out = c->audio->shadow_enabled();
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_ASSIST_ENABLED) == 0)
         *out = c->assist_tools_enabled;
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_FAST_FORWARD) == 0)
@@ -310,6 +314,10 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
         c->state_slot = std::clamp(value, 1, c->state_slot_count);
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_FPS) == 0)
         c->window->set_fps_readout(value != 0);
+    else if (std::strcmp(item->key, GBARECOMP_UI_KEY_AUDIO_ENHANCED) == 0 && c->audio) {
+        c->audio->set_shadow_enabled(value != 0);
+        c->window->save_audio_enhanced(value != 0);
+    }
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_ASSIST_ENABLED) == 0) {
         c->assist_tools_enabled = value != 0;
         if (!c->assist_tools_enabled) c->fast_forward_latched = false;
@@ -2899,6 +2907,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                                 opts.touch_gesture_claims,
                                 opts.touch_pad_default, args.touch_emulation);
             win.set_touch_config_dir(exe_dir.c_str());
+            // The player's menu choice wins over [audio].shadow;
+            // GBARECOMP_AUDIO_SHADOW still overrides both.
+            bool enhanced = false;
+            if (win.saved_audio_enhanced(enhanced) &&
+                !std::getenv("GBARECOMP_AUDIO_SHADOW"))
+                bus.audio().set_shadow_enabled(enhanced);
         }
         win.set_host_overlay(opts.host_overlay);
         win.set_view_margins(ppu.view_extra_left(), ppu.view_extra_right(),
@@ -2945,6 +2959,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         win.set_fps_readout(opts.show_fps_by_default);
 #if defined(GBARECOMP_RUNTIME_UI)
         runtime_ui_context.window = &win;
+        runtime_ui_context.audio = &bus.audio();
         runtime_ui_context.gyro_sensitivity = &args.gyro_sensitivity;
         runtime_ui_context.assist_tools_exposed = opts.expose_assist_tools;
         runtime_ui_context.assist_tools_enabled =
@@ -3099,6 +3114,17 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 rewind_item.type        = RECOMP_RUNTIME_UI_ACTION;
                 runtime_ui_extras.push_back(rewind_item);
             }
+        }
+
+        if (bus.audio().shadow_available()) {
+            RecompRuntimeUiItem enhanced_item{};
+            enhanced_item.key         = GBARECOMP_UI_KEY_AUDIO_ENHANCED;
+            enhanced_item.section     = "Audio";
+            enhanced_item.label       = "Enhanced audio";
+            enhanced_item.description =
+                "High-precision mix, without the 8-bit hiss.";
+            enhanced_item.type        = RECOMP_RUNTIME_UI_BOOL;
+            runtime_ui_extras.push_back(enhanced_item);
         }
 
         RecompRuntimeUiItem fps_item{};

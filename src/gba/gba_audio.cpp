@@ -944,6 +944,7 @@ void GbaAudio::configure_shadow(const std::vector<Mp2kSig>& sigs,
     shadow_mem_.rom = rom;       shadow_mem_.rom_len = rom_len;
     shadow_mem_.ewram = ewram;   shadow_mem_.ewram_len = ewram_len;
     shadow_mem_.iwram = iwram;   shadow_mem_.iwram_len = iwram_len;
+    shadow_sigs_ = sigs;
     shadow_.init(sigs);
     shadow_cursor_ = 0;
     shadow_samples_since_hook_ = 0;
@@ -961,6 +962,19 @@ void GbaAudio::configure_shadow(const std::vector<Mp2kSig>& sigs,
         std::fprintf(stderr, "[audio] MP2K shadow mixer ARMED (verified-"
                              "enhancement; reverts to hardware mix on divergence)\n");
     }
+}
+
+void GbaAudio::set_shadow_enabled(bool on) {
+    if (!shadow_.armed() || on == shadow_enabled_) return;
+    if (on) {
+        shadow_ = Mp2kShadow{};  // voices and verifier start over
+        shadow_.init(shadow_sigs_);
+        shadow_cursor_ = 0;
+        shadow_samples_since_hook_ = 0;
+    }
+    shadow_enabled_ = on;
+    std::fprintf(stderr, "[audio] MP2K shadow mixer %s by the player\n",
+                 on ? "ARMED" : "off");
 }
 
 void GbaAudio::run_sample_event() {
