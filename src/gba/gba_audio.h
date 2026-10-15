@@ -324,6 +324,7 @@ private:
     void cap_push(const CapSample& s);
     int16_t current_samples_[kMaxSamplesPerEvent] = {};
     uint8_t current_sample_rates_[kMaxSamplesPerEvent] = {};
+    CapSample current_caps_[kMaxSamplesPerEvent] = {};
     uint32_t sample_index_ = 0;
     std::vector<FifoTrace> trace_;
     uint32_t trace_write_ = 0;
@@ -338,6 +339,10 @@ private:
     uint32_t samples_per_event() const;
     uint32_t cycles_until_next_sample_event() const;
     void sample_until_current_time();
+    // Mixes one output slot of the current event: canon, or PSG plus the
+    // MP2K shadow while it substitutes. The single place both the event and
+    // the mid-event catch-up (sample_until_current_time) produce samples.
+    void mix_slot(uint32_t slot);
     void run_sample_event();
     void ch1_trigger();
     void ch2_trigger();
