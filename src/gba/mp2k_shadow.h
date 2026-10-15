@@ -88,6 +88,11 @@ private:
         int8_t   blk[64] = {};
         float    chk_hold = 0.0f;    // canon-domain check-copy hold
         double   chk_acc = 0.0;
+        // Output gains as applied, gliding towards the tick's target so a
+        // gain step (note release, voice end) is not a click. The check
+        // copy keeps the driver's stepped gains.
+        float    out_r = 0.0f, out_l = 0.0f;
+        bool     ending = false;     // driver ended it; fading out, then off
     };
 
     bool note_on(Voice& v, const MemView& mem, uint8_t ctype, uint32_t count,
