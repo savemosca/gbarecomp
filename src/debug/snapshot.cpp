@@ -40,6 +40,10 @@ constexpr char kMagic[4] = {'G', 'B', 'A', 'S'};
 // continuation pending, as version-2 runtimes restored it, so suspend states
 // and save slots survive the engine update.
 constexpr uint32_t kSwiLessSnapshotVersion = 2;
+// Versions 2 and 4 predate the TIME section and PSG channels 3/4 in AUDIO
+// (v5). They load as those runtimes restored them: pending device timing
+// starts afresh and channels 3/4 reset, so suspend states survive the update.
+constexpr uint32_t kPreTimingSnapshotVersion = 4;
 
 // FourCC section tags.
 constexpr uint32_t fourcc(char a, char b, char c, char d) {
@@ -230,7 +234,8 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
         return false;
     }
     uint32_t version = head.u32();
-    if (version != kSnapshotVersion && version != kSwiLessSnapshotVersion) {
+    if (version != kSnapshotVersion && version != kSwiLessSnapshotVersion &&
+        version != kPreTimingSnapshotVersion) {
         if (err) {
             *err = "snapshot: version mismatch (file v" +
                    std::to_string(version) + ", runtime v" +
@@ -293,13 +298,21 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
     }
 
     // All gameplay-relevant sections must be present. META is advisory.
+    const bool pre_timing = version < kSnapshotVersion;
     const uint32_t required[] = {TAG_CPU, TAG_BUS, TAG_IO,
                                  TAG_AUDIO, TAG_SAVE, TAG_PPU, TAG_TIME};
     for (uint32_t tag : required) {
+        if (tag == TAG_TIME && pre_timing) continue;
         if (sections.find(tag) == sections.end()) {
             if (err) *err = "snapshot: missing required section";
             return false;
         }
+    }
+    // An older version number on a newer layout (or the reverse) is refused
+    // rather than read with the wrong one.
+    if (pre_timing && sections.find(TAG_TIME) != sections.end()) {
+        if (err) *err = "snapshot: v" + std::to_string(version) + " file with a timing section";
+        return false;
     }
 
     // MODS preflight happens after the immutable container/header checks, but
@@ -329,8 +342,20 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
         return SnapshotReader(base, len);
     };
 
-    RuntimeTimingContext timing;
+    // The audio section has no length of its own to check, so parse it into
+    // a scratch mixer first: it must end exactly where the section does.
     {
+        SnapshotReader r = reader_for(TAG_AUDIO);
+        gba::GbaAudio probe;
+        probe.deserialize(r, !pre_timing);
+        if (!r.ok() || r.remaining() != 0) {
+            if (err) *err = "snapshot: audio section does not match its version";
+            return false;
+        }
+    }
+
+    RuntimeTimingContext timing;
+    if (!pre_timing) {
         if (sections.at(TAG_TIME).len != 40) {
             if (err) *err = "snapshot: invalid timing section size";
             return false;
@@ -357,7 +382,7 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
     { SnapshotReader r = reader_for(TAG_IO);    ctx.bus->io().deserialize(r); }
     // WAITCNT arrived with the IO page; re-derive the bus wait-state table.
     ctx.bus->refresh_waitstates();
-    { SnapshotReader r = reader_for(TAG_AUDIO); ctx.bus->audio().deserialize(r); }
+    { SnapshotReader r = reader_for(TAG_AUDIO); ctx.bus->audio().deserialize(r, !pre_timing); }
     { SnapshotReader r = reader_for(TAG_SAVE);  ctx.bus->save().deserialize(r); }
     { SnapshotReader r = reader_for(TAG_PPU);   ctx.ppu->deserialize(r); }
     if (sections.find(TAG_META) != sections.end()) {
@@ -371,7 +396,7 @@ bool load_state_bytes(const uint8_t* data, std::size_t size,
         // live, so continuing after a provider violation would be unsafe.
         if (!ctx.mod_state->restore(mods_reader, err)) std::abort();
     }
-    runtime_restore_timing_context(timing);
+    if (!pre_timing) runtime_restore_timing_context(timing);
 
     return true;
 }

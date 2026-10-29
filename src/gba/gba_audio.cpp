@@ -44,14 +44,16 @@ GbaAudio::GbaAudio() {
 }
 GbaAudio::~GbaAudio() = default;
 
-void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w) const {
+void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w, bool with_psg34) const {
     // Channels + FIFOs are POD nested structs (no pointers); raw bytes
     // are stable within a build and the snapshot version gates layout.
     w.bytes(&ch1_, sizeof(ch1_));
     w.bytes(&ch2_, sizeof(ch2_));
-    w.bytes(&ch3_, sizeof(ch3_));
-    w.bytes(&ch4_, sizeof(ch4_));
-    w.bytes(wave_ram_, sizeof(wave_ram_));
+    if (with_psg34) {
+        w.bytes(&ch3_, sizeof(ch3_));
+        w.bytes(&ch4_, sizeof(ch4_));
+        w.bytes(wave_ram_, sizeof(wave_ram_));
+    }
     w.boolean(master_enable_);
     w.u8(volume_l_);
     w.u8(volume_r_);
@@ -59,10 +61,12 @@ void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w) const {
     w.boolean(ch1_right_enable_);
     w.boolean(ch2_left_enable_);
     w.boolean(ch2_right_enable_);
-    w.boolean(ch3_left_enable_);
-    w.boolean(ch3_right_enable_);
-    w.boolean(ch4_left_enable_);
-    w.boolean(ch4_right_enable_);
+    if (with_psg34) {
+        w.boolean(ch3_left_enable_);
+        w.boolean(ch3_right_enable_);
+        w.boolean(ch4_left_enable_);
+        w.boolean(ch4_right_enable_);
+    }
     w.u8(dmg_volume_ratio_);
     w.bytes(&fifo_a_, sizeof(fifo_a_));
     w.bytes(&fifo_b_, sizeof(fifo_b_));
@@ -87,12 +91,18 @@ void GbaAudio::serialize(gbarecomp::debug::SnapshotWriter& w) const {
     w.u32(sample_index_);
 }
 
-void GbaAudio::deserialize(gbarecomp::debug::SnapshotReader& r) {
+void GbaAudio::deserialize(gbarecomp::debug::SnapshotReader& r, bool with_psg34) {
     r.bytes(&ch1_, sizeof(ch1_));
     r.bytes(&ch2_, sizeof(ch2_));
-    r.bytes(&ch3_, sizeof(ch3_));
-    r.bytes(&ch4_, sizeof(ch4_));
-    r.bytes(wave_ram_, sizeof(wave_ram_));
+    if (with_psg34) {
+        r.bytes(&ch3_, sizeof(ch3_));
+        r.bytes(&ch4_, sizeof(ch4_));
+        r.bytes(wave_ram_, sizeof(wave_ram_));
+    } else {
+        ch3_ = Sound3{};
+        ch4_ = Sound4{};
+        std::fill(std::begin(wave_ram_), std::end(wave_ram_), uint8_t{0});
+    }
     master_enable_    = r.boolean();
     volume_l_         = r.u8();
     volume_r_         = r.u8();
@@ -100,10 +110,12 @@ void GbaAudio::deserialize(gbarecomp::debug::SnapshotReader& r) {
     ch1_right_enable_ = r.boolean();
     ch2_left_enable_  = r.boolean();
     ch2_right_enable_ = r.boolean();
-    ch3_left_enable_ = r.boolean();
-    ch3_right_enable_ = r.boolean();
-    ch4_left_enable_ = r.boolean();
-    ch4_right_enable_ = r.boolean();
+    if (with_psg34) {
+        ch3_left_enable_ = r.boolean();
+        ch3_right_enable_ = r.boolean();
+        ch4_left_enable_ = r.boolean();
+        ch4_right_enable_ = r.boolean();
+    }
     dmg_volume_ratio_ = r.u8();
     r.bytes(&fifo_a_, sizeof(fifo_a_));
     r.bytes(&fifo_b_, sizeof(fifo_b_));
