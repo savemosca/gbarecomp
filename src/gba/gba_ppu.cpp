@@ -46,6 +46,8 @@ extern "C" int g_ws_affine_filter_enabled = 0;
 extern "C" int (*g_ws_affine_filter_provider)(int, int) = nullptr;
 extern "C" int g_ws_authored_margin_layers = 0;
 extern "C" int g_ws_native_view_left = -1;
+extern "C" int g_ws_native_view_top = -1;
+extern "C" void (*g_ws_frame_start)() = nullptr;
 
 // Widescreen pillarbox (Step C policy): when nonzero, the wide path renders the
 // margin columns (outside the central 240) as solid black instead of extended
@@ -70,6 +72,9 @@ extern "C" int (*g_ws_obj_attr_y_provider)(int, std::uint16_t,
                                             std::uint16_t, std::uint16_t,
                                             int*) = nullptr;
 extern "C" const WsMarginObjPixel* (*g_ws_obj_margin_provider)(int, int*, int*) = nullptr;
+extern "C" int g_ppu_record_motion = 0;
+extern "C" int (*g_present_interpolator)(const GbaPpu*, const uint8_t*, uint32_t, uint32_t,
+                                         uint8_t*, float) = nullptr;
 
 namespace {
 struct ReadOnlyWideBgProviders {
@@ -94,6 +99,17 @@ void publish_read_only_wide_bg_providers(WsBgXRowProvider x_rows,
 void clear_read_only_wide_bg_providers() { read_only_wide_bg = {}; }
 
 namespace {
+
+// Tag row for the scanline being composited into the work framebuffer (see
+// GbaPpu::MotionLine); null for every other render (screenshots, re-latches).
+std::uint16_t* g_tag_row = nullptr;
+inline std::uint16_t motion_tag(int key, std::uint8_t layer) {
+    if (layer == 5) return 0xFFFFu;
+    return static_cast<std::uint16_t>(key < 0 || key > 0xFFFE ? 0xFFFE : key);
+}
+inline void fill_tags(std::uint32_t width) {
+    if (g_tag_row) std::fill(g_tag_row, g_tag_row + width, static_cast<std::uint16_t>(0xFFFFu));
+}
 
 // These pointers have no C linkage and are deliberately not declared by the
 // public PPU header. Only the engine-internal seam below can publish them.
@@ -147,10 +163,10 @@ void GbaPpu::serialize(gbarecomp::debug::SnapshotWriter& w) const {
         std::array<uint8_t, kFramebufferBytes> center{};
         constexpr std::size_t kNativeStride = kScreenWidth * 3u;
         const std::size_t wide_stride = render_width() * 3u;
-        const std::size_t center_x = extra_left_ * 3u;
+        const std::size_t center_x = native_view_x() * 3u;
         for (std::size_t y = 0; y < kScreenHeight; ++y) {
             std::memcpy(center.data() + y * kNativeStride,
-                        latched_fb_.data() + (y + extra_top_) * wide_stride + center_x,
+                        latched_fb_.data() + (y + native_view_y()) * wide_stride + center_x,
                         kNativeStride);
         }
         w.bytes(center.data(), center.size());
@@ -194,9 +210,9 @@ void GbaPpu::deserialize(gbarecomp::debug::SnapshotReader& r) {
         // show the restored image instead of stale pre-load pixels.
         constexpr std::size_t kNativeStride = kScreenWidth * 3u;
         const std::size_t wide_stride = render_width() * 3u;
-        const std::size_t center_x = extra_left_ * 3u;
+        const std::size_t center_x = native_view_x() * 3u;
         for (std::size_t y = 0; y < kScreenHeight; ++y) {
-            std::memcpy(work_fb_.data() + (y + extra_top_) * wide_stride + center_x,
+            std::memcpy(work_fb_.data() + (y + native_view_y()) * wide_stride + center_x,
                         native_latch.data() + y * kNativeStride,
                         kNativeStride);
         }
@@ -228,6 +244,16 @@ void GbaPpu::reset() {
     affine_line_ = {};
     std::memset(latched_fb_.data(), 0xFF, latched_fb_.size());
     std::memset(work_fb_.data(), 0xFF, work_fb_.size());
+}
+
+uint32_t GbaPpu::native_view_x() const {
+    if (g_ws_native_view_left < 0) return extra_left_;
+    return std::min(static_cast<uint32_t>(g_ws_native_view_left), render_width() - kScreenWidth);
+}
+
+uint32_t GbaPpu::native_view_y() const {
+    if (g_ws_native_view_top < 0) return extra_top_;
+    return std::min(static_cast<uint32_t>(g_ws_native_view_top), render_height() - kScreenHeight);
 }
 
 void GbaPpu::set_view_margins(uint32_t left, uint32_t right,
@@ -737,6 +763,7 @@ void render_scanline_impl(uint8_t* rgb,
     uint8_t* row = rgb + y * kScreenWidth * 3;
     if (dispcnt & 0x0080u) {
         std::memset(row, 0xFF, kScreenWidth * 3);
+        fill_tags(kScreenWidth);
         return;
     }
 
@@ -1458,6 +1485,7 @@ void render_scanline_impl(uint8_t* rgb,
     if (bldy > 16u) bldy = 16u;
     for (uint32_t x = 0; x < kScreenWidth; ++x) {
         uint8_t* dst = row + x * 3;
+        if (g_tag_row) g_tag_row[x] = motion_tag(top[x].key, top[x].layer);
         // Alpha blend top (1st target) with the layer below (2nd target). Per
         // GBATEK this occurs when effect==1 OR top is a semi-transparent OBJ
         // (mode 1 forces alpha regardless of BLDCNT). NOT gated on EVA!=0:
@@ -1539,9 +1567,9 @@ void render_scanline_wide_impl(uint8_t* rgb, int y, uint16_t dispcnt,
     if (native_equivalent) *native_equivalent=native_row && out_w==kVanW && ox==0 && oy==0;
     uint8_t* row = rgb + (y + static_cast<int>(oy)) * out_w * 3;
     if (!native_row && (!g_ws_authored_margin_layers || !g_ws_tilemap_provider || g_ws_pillarbox)) {
-        std::memset(row, 0, out_w * 3); return;
+        std::memset(row, 0, out_w * 3); fill_tags(out_w); return;
     }
-    if (dispcnt & 0x0080u) { std::memset(row, 0xFF, out_w * 3); return; }
+    if (dispcnt & 0x0080u) { std::memset(row, 0xFF, out_w * 3); fill_tags(out_w); return; }
 
     struct PixelCandidate {
 #if !defined(GBARECOMP_SCANLINE_HLE)
@@ -2514,6 +2542,7 @@ void render_scanline_wide_impl(uint8_t* rgb, int y, uint16_t dispcnt,
             submit(x, ui_color & 0x7FFFu, -1, 0, false, false);
         }
         uint8_t* dst = row + x * 3;
+        if (g_tag_row) g_tag_row[x] = motion_tag(top[x].key, top[x].layer);
         // OBJ-only presentations (notably the real GBA BIOS logo) author the
         // whole backdrop through palette entry 0. There is no regular-BG
         // alias to protect in the margins, so preserve that authentic color
@@ -2605,8 +2634,9 @@ void GbaPpu::render(uint8_t* rgb,
         return;
     }
     const uint32_t ow = render_width();
-    for (int y = -static_cast<int>(extra_top_); y < static_cast<int>(kScreenHeight + extra_bottom_); ++y) {
-        render_scanline_wide(rgb, y, dispcnt, io, vram, oam, pal, ow, extra_left_, extra_top_);
+    const int top = static_cast<int>(native_view_y());
+    for (int y = -top; y < static_cast<int>(render_height()) - top; ++y) {
+        render_scanline_wide(rgb, y, dispcnt, io, vram, oam, pal, ow, native_view_x(), top);
     }
 }
 
@@ -2913,10 +2943,29 @@ void GbaPpu::render_scanline(uint32_t y,
     }
 
     if (!rasterization_enabled_) return;
+    const bool record = g_ppu_record_motion != 0 && y < kScreenHeight;
+    if (record) {
+        if (work_tags_.empty()) {
+            work_tags_.assign(static_cast<std::size_t>(kMaxRenderWidth) * kMaxRenderHeight, 0xFFFFu);
+            latched_tags_ = work_tags_;
+            work_lines_.assign(kScreenHeight, MotionLine{});
+            latched_lines_ = work_lines_;
+        }
+        MotionLine& line = work_lines_[y];
+        line.dispcnt = dispcnt;
+        for (unsigned bg = 0; bg < 4; ++bg) {
+            line.bgcnt[bg] = static_cast<uint16_t>(io[0x08 + 2 * bg] | (io[0x09 + 2 * bg] << 8));
+            line.hofs[bg] = static_cast<uint16_t>((io[0x10 + 4 * bg] | (io[0x11 + 4 * bg] << 8)) & 0x1FF);
+            line.vofs[bg] = static_cast<uint16_t>((io[0x12 + 4 * bg] | (io[0x13 + 4 * bg] << 8)) & 0x1FF);
+        }
+        if (y == kScreenHeight - 1) std::memcpy(work_oam_.data(), oam, work_oam_.size());
+    }
 #if defined(GBARECOMP_NATIVE_DRAW_JOBS)
     // Capture at the existing post-affine, pre-HBlank-DMA boundary. Foreign
     // content is not hardware input and must execute its original callback path.
-    const bool owned = native_draw_enabled_ && draw_memory && !presentation_ &&
+    // Motion recording (smooth motion) needs every line through the
+    // compositor below, which tags it.
+    const bool owned = !record && native_draw_enabled_ && draw_memory && !presentation_ &&
         !view_expanded() && !high_resolution_ &&
         !foreign_presentation_internal::background() &&
         !foreign_presentation_internal::obj_focus() &&
@@ -2941,7 +2990,9 @@ void GbaPpu::render_scanline(uint32_t y,
     // The enhanced surface consumes only published raster inputs. Its tile
     // stack and history never replace native pixels or advance device time.
     GbaHighResolutionFrame* hd = high_resolution_.get();
-    const bool hd_line = hd && hd->begin_line(int(y), extra_left_, extra_top_,
+    if (y == 0 && g_ws_frame_start && view_expanded()) g_ws_frame_start();
+    const uint32_t ox = view_expanded() ? native_view_x() : 0, oy = view_expanded() ? native_view_y() : 0;
+    const bool hd_line = hd && hd->begin_line(int(y), ox, oy,
         dispcnt, affine_io.data(), vram, pal,
         foreign_presentation_internal::background() ||
         foreign_presentation_internal::screen_overlay() ? nullptr : high_resolution_provider_,
@@ -2951,7 +3002,7 @@ void GbaPpu::render_scanline(uint32_t y,
         // has no presentation-only coordinate/content policy. Their outputs
         // remain different: native samples are unfiltered and never use HD
         // interpolation. Materialize them immediately for snapshots/readers.
-        const bool shared=hd_line && hd->deferred_rendering() &&
+        const bool shared=!record && hd_line && hd->deferred_rendering() &&
             !foreign_presentation_internal::background() &&
             !foreign_presentation_internal::obj_focus() &&
             !foreign_presentation_internal::screen_overlay();
@@ -2961,9 +3012,11 @@ void GbaPpu::render_scanline(uint32_t y,
                 affine_io.data(),vram,oam,pal,render_width(),0,0,hd,&native_equivalent);
             if (native_equivalent && hd->try_render_native_line(work_fb_.data()+y*kScreenWidth*3,dispcnt)) return;
         }
+        if (record) g_tag_row = work_tags_.data() + static_cast<std::size_t>(y) * kScreenWidth;
         render_scanline_internal(work_fb_.data(), y, dispcnt,
                                  affine_io.data(), vram, oam, pal,
                                  kScreenWidth, kScreenHeight);
+        g_tag_row = nullptr;  // motion tags cover the native line only
         if (hd_line && !shared) {
             // The expanded compositor may apply optional presentation filters.
             // Keep its native scratch entirely separate from canonical pixels.
@@ -2972,21 +3025,28 @@ void GbaPpu::render_scanline(uint32_t y,
         } else if (hd && !hd_line) hd->upscale_line(y, work_fb_.data() + y * render_width() * 3);
         return;
     }
-    // Host-authored extra rows use this frame's published state once, at
-    // scanline zero. They never run emulated scanline timing or affine updates.
-    if (y == 0 && (extra_top_ || extra_bottom_)) {
-        for (int sy = -static_cast<int>(extra_top_); sy < static_cast<int>(kScreenHeight + extra_bottom_); ++sy) {
-            if (sy >= 0 && sy < static_cast<int>(kScreenHeight)) continue;
+    // Host-authored extra rows use the published state of the native edge row
+    // they continue: rows above at scanline zero, rows below after the last
+    // scanline, so per-line scroll effects carry on past both edges. They never
+    // run emulated scanline timing or affine updates.
+    auto render_extra_rows = [&](int from, int to) {
+        for (int sy = from; sy < to; ++sy) {
             render_scanline_wide(work_fb_.data(), sy, dispcnt, io, vram, oam, pal,
-                                 render_width(), extra_left_, extra_top_);
-            if (hd) hd->upscale_line(unsigned(sy + int(extra_top_)),
-                work_fb_.data() + size_t(sy + int(extra_top_)) * render_width() * 3);
+                                 render_width(), ox, oy);
+            if (hd) hd->upscale_line(unsigned(sy + int(oy)),
+                work_fb_.data() + size_t(sy + int(oy)) * render_width() * 3);
         }
-    }
+    };
+    if (y == 0 && oy) render_extra_rows(-static_cast<int>(oy), 0);
+    if (record)
+        g_tag_row = work_tags_.data() + static_cast<std::size_t>(y + oy) * render_width();
     render_scanline_wide(work_fb_.data(), y, dispcnt, affine_io.data(),
-                         vram, oam, pal, render_width(), extra_left_, extra_top_, hd_line ? hd : nullptr);
-    if (hd && !hd_line) hd->upscale_line(y + extra_top_,
-        work_fb_.data() + size_t(y + extra_top_) * render_width() * 3);
+                         vram, oam, pal, render_width(), ox, oy, hd_line ? hd : nullptr);
+    g_tag_row = nullptr;
+    if (hd && !hd_line) hd->upscale_line(y + oy,
+        work_fb_.data() + size_t(y + oy) * render_width() * 3);
+    if (y == kScreenHeight - 1 && render_height() > kScreenHeight + oy)
+        render_extra_rows(static_cast<int>(kScreenHeight), static_cast<int>(render_height() - oy));
 }
 
 void GbaPpu::note_affine_reference_write(unsigned bg, bool y_axis) {
@@ -3036,6 +3096,12 @@ void GbaPpu::mark_framebuffer_latched() {
         native_latched_materialized_ = true;
     }
 #endif
+    if (rasterization_enabled_ && !work_tags_.empty()) {
+        std::copy_n(work_tags_.data(), static_cast<std::size_t>(render_width()) * render_height(),
+                    latched_tags_.data());
+        latched_lines_ = work_lines_;
+        latched_oam_ = work_oam_;
+    }
     has_latched_fb_ = true;
     if (high_resolution_) high_resolution_->latch();
     if (presentation_) presentation_->frame_ready();

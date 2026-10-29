@@ -324,6 +324,17 @@ bool HostWindow::readback_hd(std::vector<uint8_t>&,unsigned&,unsigned&) { return
 bool HostWindow::present_native(const std::shared_ptr<const gba::GbaNativeDrawFrame>&) { return false; }
 bool HostWindow::readback_native(const std::shared_ptr<const gba::GbaNativeDrawFrame>&,std::vector<uint8_t>&) { return false; }
 #endif
+// Smooth motion is not offered on the web host: interpolated 2x frames are
+// skipped and native frames go through present().
+void HostWindow::present_scaled(const uint8_t* rgb, int factor) {
+    if (factor == 1) present(rgb);
+}
+bool HostWindow::display_timing(std::chrono::nanoseconds*, std::chrono::steady_clock::time_point*) const {
+    return false;
+}
+void HostWindow::set_fill_display(bool) {}
+bool HostWindow::fill_display() const { return false; }
+
 void HostWindow::present(const uint8_t* rgb) {
     if(!impl_||!rgb)return;
     auto& b=*backend(impl_);auto& s=b.shared;auto& v=s.video[b.back];

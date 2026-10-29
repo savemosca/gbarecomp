@@ -828,13 +828,26 @@ inline int gbarecomp_launcher_preboot(std::vector<std::string>& args,
     // SAME fingerprint so its "verified" check agrees with the runtime (a
     // CRC32 is dump-specific and would reject other valid dumps). CRC32, when
     // present, stays informational only.
-    const char* sha1_one[1];
+    const char* sha1_one[3];
     const char* launcher_source_sha1 = opts.launcher_source_rom_sha1
         ? opts.launcher_source_rom_sha1 : opts.builtin_rom_sha1;
     if (launcher_source_sha1 && launcher_source_sha1[0]) {
         sha1_one[0] = launcher_source_sha1;
         gi.known_sha1_hex = sha1_one;
         gi.num_known_sha1 = 1;
+        // Translation builds may also accept the already-patched target image
+        // (and optional HQ Audio Mod variant) directly; the stock source then
+        // launches only through its patch.
+        if (opts.launcher_accept_patched_rom && opts.launcher_source_rom_sha1 &&
+            opts.builtin_rom_sha1 && opts.builtin_rom_sha1[0] &&
+            std::strcmp(opts.builtin_rom_sha1, opts.launcher_source_rom_sha1) != 0) {
+            sha1_one[1] = opts.builtin_rom_sha1;
+            gi.num_known_sha1 = 2;
+            gi.rom_patch_source_sha1 = opts.launcher_source_rom_sha1;
+        }
+        if (opts.alt_rom_sha1 && opts.alt_rom_sha1[0] && gi.num_known_sha1 < 3) {
+            sha1_one[gi.num_known_sha1++] = opts.alt_rom_sha1;
+        }
     }
     gi.widescreen_supported = opts.launcher_expose_widescreen &&
         opts.widescreen_view_width > 240 ? 1 : 0;

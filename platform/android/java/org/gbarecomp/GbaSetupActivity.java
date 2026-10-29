@@ -17,12 +17,15 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.WindowInsets;
 import android.view.WindowInsetsController;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.CheckBox;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
 
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -43,6 +46,7 @@ import java.util.concurrent.Executors;
 public class GbaSetupActivity extends Activity {
     private static final int PICK_BIOS = 1001;
     private static final int PICK_ROM = 1002;
+    private static final int PICK_PATCH = 1003;
     private static final String SETUP_PREFERENCES = "setup";
     private static final String SKIP_LAUNCHER_ON_BOOT = "skip_launcher_on_boot";
     private static final long BIOS_SIZE = 16 * 1024;
@@ -58,9 +62,13 @@ public class GbaSetupActivity extends Activity {
     private Button playButton;
     private Button biosButton;
     private Button romButton;
+    private Button patchButton;
     private CheckBox skipLauncherCheck;
     private boolean biosReady;
     private boolean romReady;
+
+    protected void addGameActions(LinearLayout preferences) {}
+    protected boolean supportsAutomaticLaunch() { return true; }
 
     /** The Activity that runs the game; games may override. */
     protected Class<?> gameActivityClass() {
@@ -73,8 +81,7 @@ public class GbaSetupActivity extends Activity {
         config = GbaGameConfig.load(this);
         setRequestedOrientation(GbaGameActivity.orientationFor(config.orientation));
         if (hasBundledPrivateAssets()) {
-            startActivity(new Intent(this, gameActivityClass()));
-            finish();
+            onBundledAssets();
             return;
         }
         setContentView(buildContent());
@@ -120,7 +127,25 @@ public class GbaSetupActivity extends Activity {
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (resultCode != RESULT_OK || data == null || data.getData() == null) return;
-        if (requestCode != PICK_BIOS && requestCode != PICK_ROM) return;
+        if (requestCode != PICK_BIOS && requestCode != PICK_ROM &&
+            requestCode != PICK_PATCH) return;
+        if (requestCode == PICK_PATCH) {
+            final Uri patch = data.getData();
+            setBusy(true, "Applying ROM patch…");
+            worker.execute(() -> {
+                try {
+                    applyRomPatch(patch);
+                    runOnUiThread(() -> { setBusy(false, null); refreshStatus(); });
+                } catch (Exception error) {
+                    runOnUiThread(() -> {
+                        setBusy(false, null);
+                        refreshStatus();
+                        showError("Patch not accepted", error.getMessage());
+                    });
+                }
+            });
+            return;
+        }
         final boolean bios = requestCode == PICK_BIOS;
         final Uri uri = data.getData();
         setBusy(true, bios ? "Checking BIOS…" : "Checking ROM…");
@@ -198,6 +223,11 @@ public class GbaSetupActivity extends Activity {
         romButton.setOnClickListener(view -> pickFile(PICK_ROM));
         romCard.addView(romStatus, margins(-1, -2, 0, dp(4), 0, dp(4)));
         romCard.addView(romButton, margins(-1, dp(48), 0, 0, 0, 0));
+        if (!config.romPatchSourceSha1.isEmpty()) {
+            patchButton = actionButton("CHOOSE LANGUAGE PATCH");
+            patchButton.setOnClickListener(view -> pickFile(PICK_PATCH));
+            romCard.addView(patchButton, margins(-1, dp(48), 0, dp(6), 0, 0));
+        }
         assets.addView(romCard, vertical ? margins(-1, -2, 0, dp(6), 0, dp(6))
                                          : weightedMargins(1, dp(8), 0, dp(8), 0));
 
@@ -226,10 +256,51 @@ public class GbaSetupActivity extends Activity {
         privacy.setGravity(Gravity.CENTER);
         root.addView(privacy, margins(-1, -2, 0, 0, 0, 0));
 
+        // The options and PLAY scroll with the file cards: games add their own
+        // options here, and a fixed footer that tall left no room for the cards
+        // on short landscape phones (about 410 dp high).
         LinearLayout footer = new LinearLayout(this);
         footer.setOrientation(vertical ? LinearLayout.VERTICAL : LinearLayout.HORIZONTAL);
         footer.setGravity(Gravity.CENTER);
-        footer.setPadding(dp(vertical ? 20 : 36), dp(8), dp(vertical ? 20 : 36), dp(18));
+        footer.setPadding(0, dp(8), 0, dp(18));
+
+        LinearLayout preferences = new LinearLayout(this);
+        preferences.setOrientation(LinearLayout.VERTICAL);
+
+        Switch fullscreenSwitch = new Switch(this);
+        fullscreenSwitch.setText("Hide system bars");
+        fullscreenSwitch.setTextColor(Color.rgb(203, 212, 238));
+        fullscreenSwitch.setTextSize(14);
+        fullscreenSwitch.setMinHeight(dp(52));
+        fullscreenSwitch.setChecked(getSharedPreferences("display", MODE_PRIVATE)
+            .getBoolean("fullscreen", true));
+        fullscreenSwitch.setOnCheckedChangeListener((button, checked) -> {
+            getSharedPreferences("display", MODE_PRIVATE).edit()
+                .putBoolean("fullscreen", checked).apply();
+            applyFullscreen(checked);
+        });
+        preferences.addView(fullscreenSwitch);
+        Switch fillSwitch = new Switch(this);
+        fillSwitch.setText("Fill display (stretch)");
+        fillSwitch.setTextColor(Color.rgb(203, 212, 238));
+        fillSwitch.setTextSize(14);
+        fillSwitch.setMinHeight(dp(52));
+        fillSwitch.setChecked(getSharedPreferences("display", MODE_PRIVATE)
+            .getBoolean("fill_display", false));
+        fillSwitch.setOnCheckedChangeListener((button, checked) ->
+            getSharedPreferences("display", MODE_PRIVATE).edit()
+                .putBoolean("fill_display", checked).apply());
+        preferences.addView(fillSwitch);
+
+        CheckBox touchPadCheck = new CheckBox(this);
+        touchPadCheck.setText("Show on-screen game buttons");
+        touchPadCheck.setTextColor(Color.rgb(203, 212, 238));
+        touchPadCheck.setTextSize(14);
+        touchPadCheck.setMinHeight(dp(52));
+        touchPadCheck.setChecked(touchPadVisible());
+        touchPadCheck.setOnCheckedChangeListener((button, checked) -> saveTouchPadVisible(checked));
+        preferences.addView(touchPadCheck);
+        addGameActions(preferences);
 
         skipLauncherCheck = new CheckBox(this);
         skipLauncherCheck.setText("Skip this screen on launch when ready");
@@ -240,7 +311,9 @@ public class GbaSetupActivity extends Activity {
         skipLauncherCheck.setOnCheckedChangeListener((button, checked) ->
             getSharedPreferences(SETUP_PREFERENCES, MODE_PRIVATE)
                 .edit().putBoolean(SKIP_LAUNCHER_ON_BOOT, checked).apply());
-        footer.addView(skipLauncherCheck, vertical
+        if (supportsAutomaticLaunch()) preferences.addView(skipLauncherCheck);
+        else skipLauncherCheck = null;
+        footer.addView(preferences, vertical
             ? margins(-2, -2, 0, 0, 0, dp(8)) : weightedMargins(1, 0, 0, dp(18), 0));
 
         playButton = actionButton("PLAY");
@@ -249,7 +322,7 @@ public class GbaSetupActivity extends Activity {
         playButton.setOnClickListener(view -> launchGame());
         footer.addView(playButton, margins(vertical ? -1 : dp(360), dp(58), 0, 0, 0, 0));
 
-        page.addView(footer, new LinearLayout.LayoutParams(
+        root.addView(footer, new LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT));
         return page;
     }
@@ -297,11 +370,23 @@ public class GbaSetupActivity extends Activity {
 
     private File biosFile() { return new File(getFilesDir(), "bios/gba_bios.bin"); }
     private File romFile() { return new File(getFilesDir(), "roms/" + config.romFile); }
+    private File sourceRomFile() { return new File(getFilesDir(), "roms/source.gba"); }
 
     private void refreshStatus() {
         biosReady = biosFile().isFile() && biosFile().length() == BIOS_SIZE;
         romReady = romFile().isFile() && romFile().length() == config.romSize;
-        setAssetStatus(romStatus, romButton, romReady, "ROM", true);
+        boolean sourceReady = sourceRomFile().isFile() &&
+            sourceRomFile().length() == config.romSize;
+        if (sourceReady && !romReady) {
+            romStatus.setText("●  Japanese source ready; choose a patch");
+            romStatus.setTextColor(Color.rgb(120, 235, 171));
+        } else {
+            setAssetStatus(romStatus, romButton, romReady, "ROM", true);
+        }
+        if (patchButton != null) {
+            patchButton.setEnabled(sourceReady);
+            patchButton.setAlpha(sourceReady ? 1.0f : 0.45f);
+        }
         setAssetStatus(biosStatus, biosButton, biosReady, "BIOS", config.biosRequired);
         playButton.setEnabled(ready());
         playButton.setAlpha(playButton.isEnabled() ? 1.0f : 0.35f);
@@ -349,11 +434,99 @@ public class GbaSetupActivity extends Activity {
     }
 
     private boolean skipLauncherOnBoot() {
-        return getSharedPreferences(SETUP_PREFERENCES, MODE_PRIVATE)
-            .getBoolean(SKIP_LAUNCHER_ON_BOOT, true);
+        return supportsAutomaticLaunch() && getSharedPreferences(SETUP_PREFERENCES, MODE_PRIVATE)
+            .getBoolean(SKIP_LAUNCHER_ON_BOOT, false);
     }
 
-    private boolean hasBundledPrivateAssets() {
+    private boolean touchPadVisible() {
+        if (getSharedPreferences("touch", MODE_PRIVATE).contains("pad_visible"))
+            return getSharedPreferences("touch", MODE_PRIVATE)
+                .getBoolean("pad_visible", true);
+        File file = new File(getFilesDir(), "config.ini");
+        if (!file.isFile()) return true;
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                new java.io.FileReader(file))) {
+            boolean inTouch = false;
+            String line;
+            while ((line = reader.readLine()) != null) {
+                line = line.trim();
+                if (line.startsWith("[") && line.endsWith("]"))
+                    inTouch = line.equalsIgnoreCase("[Touch]");
+                else if (inTouch && line.contains("=") &&
+                        line.substring(0, line.indexOf('=')).trim().equalsIgnoreCase("pad_visible"))
+                    return !line.substring(line.indexOf('=') + 1).trim().equals("0");
+            }
+        } catch (IOException ignored) {
+        }
+        return true;
+    }
+
+    private void saveTouchPadVisible(boolean visible) {
+        getSharedPreferences("touch", MODE_PRIVATE).edit()
+            .putBoolean("pad_visible", visible).apply();
+        File file = new File(getFilesDir(), "config.ini");
+        java.util.ArrayList<String> lines = new java.util.ArrayList<>();
+        boolean found = false, inTouch = false, wrote = false;
+        if (file.isFile()) {
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.FileReader(file))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    String trimmed = line.trim();
+                    if (trimmed.startsWith("[") && trimmed.endsWith("]")) {
+                        if (inTouch && !wrote) {
+                            lines.add("pad_visible = " + (visible ? 1 : 0));
+                            wrote = true;
+                        }
+                        inTouch = trimmed.equalsIgnoreCase("[Touch]");
+                        found |= inTouch;
+                    }
+                    if (inTouch && trimmed.contains("=") &&
+                        trimmed.substring(0, trimmed.indexOf('=')).trim()
+                            .equalsIgnoreCase("pad_visible")) {
+                        if (!wrote) lines.add("pad_visible = " + (visible ? 1 : 0));
+                        wrote = true;
+                        continue;
+                    }
+                    lines.add(line);
+                }
+            } catch (IOException error) {
+                showError("Could not save setting", error.getMessage());
+                return;
+            }
+        }
+        if (inTouch && !wrote) lines.add("pad_visible = " + (visible ? 1 : 0));
+        if (!found) {
+            lines.add("[Touch]");
+            lines.add("pad_visible = " + (visible ? 1 : 0));
+        }
+        File temporary;
+        try {
+            temporary = File.createTempFile("config-", ".tmp", getFilesDir());
+            try (FileOutputStream output = new FileOutputStream(temporary)) {
+                for (String line : lines)
+                    output.write((line + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            }
+            java.nio.file.Files.move(temporary.toPath(), file.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                java.nio.file.StandardCopyOption.ATOMIC_MOVE);
+        } catch (IOException error) {
+            showError("Could not save setting", error.getMessage());
+        }
+    }
+
+    /**
+     * An APK with an embedded ROM (and BIOS) has nothing to set up. By default
+     * the game starts at once and this screen closes; a game may override this
+     * to show its own launcher (it then owns the content view).
+     */
+    protected void onBundledAssets() {
+        startActivity(new Intent(this, gameActivityClass()));
+        finish();
+    }
+
+    /** True when this APK carries the verified ROM (and BIOS) as private assets. */
+    protected boolean hasBundledPrivateAssets() {
         try (InputStream rom = getAssets().open("payload/roms/" + config.romFile)) {
             if (rom.read() < 0) return false;
         } catch (IOException ignored) {
@@ -371,8 +544,7 @@ public class GbaSetupActivity extends Activity {
             throws IOException, NoSuchAlgorithmException {
         String displayName = displayName(uri);
         long expectedSize = bios ? BIOS_SIZE : config.romSize;
-        File destination = bios ? biosFile() : romFile();
-        File directory = destination.getParentFile();
+        File directory = (bios ? biosFile() : romFile()).getParentFile();
         if (directory != null && !directory.isDirectory() && !directory.mkdirs()) {
             throw new IOException("Could not create the private game directory.");
         }
@@ -397,14 +569,18 @@ public class GbaSetupActivity extends Activity {
             throw error;
         }
         String actual = toHex(digest.digest());
+        boolean patchSource = !bios && !config.romPatchSourceSha1.isEmpty() &&
+            config.romPatchSourceSha1.equals(actual);
         boolean accepted = total == expectedSize &&
-            (bios ? config.biosSha1.equals(actual) : config.romAccepted(actual));
+            (bios ? config.biosSha1.equals(actual)
+                  : config.romAccepted(actual) || patchSource);
         if (!accepted) {
             temporary.delete();
             throw new IOException(String.format(Locale.US,
                 "%s is not the supported clean %s dump.\n\nSize: %,d bytes (expected %,d)\nSHA-1: %s",
                 displayName, bios ? "GBA BIOS" : config.romLabel, total, expectedSize, actual));
         }
+        File destination = bios ? biosFile() : patchSource ? sourceRomFile() : romFile();
         if (destination.exists() && !destination.delete()) {
             temporary.delete();
             throw new IOException("Could not replace the previously imported file.");
@@ -412,6 +588,78 @@ public class GbaSetupActivity extends Activity {
         if (!temporary.renameTo(destination)) {
             copyFile(temporary, destination);
             temporary.delete();
+        }
+        if (patchSource) copyFile(destination, romFile());
+        if (!bios) clearSuspendMarker();
+    }
+
+    private void applyRomPatch(Uri uri) throws IOException {
+        File source = sourceRomFile();
+        if (!source.isFile() || source.length() != config.romSize)
+            throw new IOException("Choose the clean Japanese ROM first.");
+        byte[] patched;
+        try {
+            patched = GbaNative.applyRomPatch(readLimited(source, config.romSize),
+                readDocumentLimited(uri, 16L * 1024 * 1024));
+        } catch (UnsatisfiedLinkError error) {
+            throw new IOException("The native patch engine is unavailable in this build.", error);
+        }
+        if (patched == null || patched.length != config.romSize)
+            throw new IOException("The patch did not produce a valid 32 MiB MOTHER 3 ROM.");
+        File destination = romFile();
+        File parent = destination.getParentFile();
+        if (!parent.isDirectory() && !parent.mkdirs())
+            throw new IOException("Could not create the private ROM directory.");
+        File temporary = File.createTempFile("patched-", ".gba", parent);
+        try (FileOutputStream output = new FileOutputStream(temporary)) {
+            output.write(patched);
+            output.getFD().sync();
+        }
+        if (destination.exists() && !destination.delete()) {
+            temporary.delete();
+            throw new IOException("Could not replace the previously installed ROM.");
+        }
+        if (!temporary.renameTo(destination)) {
+            copyFile(temporary, destination);
+            temporary.delete();
+        }
+        clearSuspendMarker();
+    }
+
+    private void clearSuspendMarker() {
+        String name = config.romFile;
+        int extension = name.lastIndexOf('.');
+        if (extension >= 0) name = name.substring(0, extension);
+        new File(getFilesDir(), "roms/" + name + ".suspend.pending").delete();
+    }
+
+    private static byte[] readLimited(File file, long limit) throws IOException {
+        if (file.length() > limit) throw new IOException("ROM file is too large.");
+        try (FileInputStream input = new FileInputStream(file);
+             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            copyLimited(input, output, limit);
+            return output.toByteArray();
+        }
+    }
+
+    private byte[] readDocumentLimited(Uri uri, long limit) throws IOException {
+        try (InputStream input = getContentResolver().openInputStream(uri);
+             ByteArrayOutputStream output = new ByteArrayOutputStream()) {
+            if (input == null) throw new IOException("Android could not open the selected patch.");
+            copyLimited(input, output, limit);
+            return output.toByteArray();
+        }
+    }
+
+    private static void copyLimited(InputStream input, ByteArrayOutputStream output,
+                                    long limit) throws IOException {
+        byte[] buffer = new byte[65536];
+        int read;
+        while ((read = input.read(buffer)) >= 0) {
+            if (read == 0) continue;
+            if ((long) output.size() + read > limit)
+                throw new IOException("Patch files must be 16 MiB or smaller.");
+            output.write(buffer, 0, read);
         }
     }
 
@@ -442,6 +690,8 @@ public class GbaSetupActivity extends Activity {
     private void setBusy(boolean busy, String label) {
         biosButton.setEnabled(!busy);
         romButton.setEnabled(!busy);
+        if (patchButton != null)
+            patchButton.setEnabled(!busy && sourceRomFile().isFile());
         playButton.setEnabled(!busy && ready());
         if (busy && label != null) {
             infoStatus.setText(label);
@@ -458,18 +708,33 @@ public class GbaSetupActivity extends Activity {
     }
 
     private void enterImmersiveMode() {
+        applyFullscreen(getSharedPreferences("display", MODE_PRIVATE)
+            .getBoolean("fullscreen", true));
+    }
+
+    private void applyFullscreen(boolean fullscreen) {
+        if (fullscreen) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FORCE_NOT_FULLSCREEN);
+        } else {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_FORCE_NOT_FULLSCREEN);
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        }
         if (Build.VERSION.SDK_INT >= 30) {
             WindowInsetsController controller = getWindow().getInsetsController();
             if (controller != null) {
-                controller.hide(WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars());
+                int bars = WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars();
+                if (fullscreen) controller.hide(bars);
+                else controller.show(bars);
                 controller.setSystemBarsBehavior(
                     WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
             }
         } else {
-            getWindow().getDecorView().setSystemUiVisibility(
+            getWindow().getDecorView().setSystemUiVisibility(fullscreen ?
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY | View.SYSTEM_UI_FLAG_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
-                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+                    | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION | View.SYSTEM_UI_FLAG_LAYOUT_STABLE
+                : View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
         }
     }
 

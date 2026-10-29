@@ -52,6 +52,14 @@ public:
     // old behavior. Fast-forward presents one frame per wait already, so
     // it is unaffected. The behind-resync below still bounds real stalls.
     void wait_for_next_frame(uint64_t frames = 1);
+    // Smooth motion: when the previous frame should be fully on screen. It
+    // trails this frame's start by the slowest recent emulate time plus 2 ms,
+    // so the frames drawn between it and this one keep an even pace.
+    std::chrono::steady_clock::time_point smooth_origin();
+    std::chrono::steady_clock::time_point frame_start() const { return next_ - period_; }
+    std::chrono::nanoseconds period() const { return period_; }
+    // Sleep until `t` without moving the deadline. No-op while uncapped.
+    void sleep_until(std::chrono::steady_clock::time_point t);
 
     // Realign the deadline to "now". Call after any non-real-time jump
     // (startup, save-state load) so the pacer doesn't try to catch up.
@@ -64,8 +72,14 @@ public:
 
 private:
     using clock = std::chrono::steady_clock;
+    void sleep_until_point(clock::time_point target);
     std::chrono::nanoseconds period_{};
     clock::time_point next_{};
+    // Time lost to late frames, repaid in small slices so the emulation
+    // stays real-time on average (audio production would otherwise fall
+    // behind the host's audio clock) without a visibly short frame.
+    std::chrono::nanoseconds debt_{0};
+    std::chrono::nanoseconds lead_{};  // smooth_origin()'s offset into the frame
     bool uncapped_ = false;
     bool raised_timer_res_ = false;
     // HP-002: Windows high-resolution waitable timer (HANDLE, void* here to

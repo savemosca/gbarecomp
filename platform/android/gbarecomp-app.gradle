@@ -8,6 +8,7 @@
 //
 // Required gbaGame keys:
 //   applicationId, versionCode, versionName, title, romSha1 (list or CSV),
+//   romPatchSourceSha1 (optional),
 //   romSize, romFile, variant (variants/<variant>/game.toml target path),
 //   gameToml (File: Android runtime TOML), gameRoot (File), engineRoot (File)
 // Optional:
@@ -30,6 +31,8 @@ required.each { key ->
 
 def engineRoot = file(g.engineRoot)
 def gameRoot = file(g.gameRoot)
+def prebuiltNativeDir = providers.gradleProperty("gbaPrebuiltNativeDir").orNull
+    ? file(providers.gradleProperty("gbaPrebuiltNativeDir").get()) : null
 def platformRoot = new File(engineRoot, "platform/android")
 def sdlRoot = new File(platformRoot, "third_party/SDL")
 if (!new File(sdlRoot, "CMakeLists.txt").isFile())
@@ -104,6 +107,7 @@ android {
             gbaTitle: g.title,
             gbaRomLabel: g.romLabel ?: "${g.title} ROM",
             gbaRomSha1: romShas.join(","),
+            gbaRomPatchSourceSha1: g.romPatchSourceSha1 ?: "",
             gbaRomSize: "${g.romSize}",
             gbaRomFile: g.romFile,
             gbaBiosRequired: "${g.biosRequired ?: false}",
@@ -115,7 +119,8 @@ android {
             gbaGyro: "${g.gyro ?: false}",
         ]
 
-        externalNativeBuild {
+        if (prebuiltNativeDir == null) {
+          externalNativeBuild {
             cmake {
                 // Generated guest shards are huge; bound concurrent compiles so
                 // a build cannot exhaust host memory (-PgbaNativeJobs=N).
@@ -138,6 +143,7 @@ android {
                 cppFlags "-O2"
                 targets "main"
             }
+          }
         }
     }
 
@@ -171,10 +177,12 @@ android {
         }
     }
 
-    externalNativeBuild {
-        cmake {
-            path new File(platformRoot, "cpp/CMakeLists.txt")
-            version "3.22.1"
+    if (prebuiltNativeDir == null) {
+        externalNativeBuild {
+            cmake {
+                path new File(platformRoot, "cpp/CMakeLists.txt")
+                version "3.22.1"
+            }
         }
     }
 
@@ -185,6 +193,7 @@ android {
                             new File(platformRoot, "java")]
             res.srcDirs = [new File(platformRoot, "res"), file("src/main/res")]
             assets.srcDirs = [stagedPayload]
+            if (prebuiltNativeDir != null) jniLibs.srcDir(prebuiltNativeDir)
         }
         debug {
             manifest.srcFile new File(platformRoot, "debug/AndroidManifest.xml")

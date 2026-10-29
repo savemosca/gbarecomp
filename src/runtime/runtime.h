@@ -50,6 +50,10 @@ struct RunOptions {
     std::shared_ptr<GbaNetplayLaunch> netplay;
     const char*   builtin_game_name = nullptr;
     const char*   builtin_rom_sha1  = nullptr;
+    const char*   alt_rom_sha1      = nullptr;  // optional secondary verified ROM SHA-1 (e.g. HQ Sound Mixing Mod)
+    bool (*rom_post_load_hook)(std::uint8_t*, std::size_t, const char*) = nullptr;
+    bool allow_rom_sha1_mismatch = false;  // mismatched cartridges always use the interpreter
+    int runtime_menu_scancode = 41;  // SDL Escape; games may select F11 (68)
     std::uint32_t builtin_rom_crc32 = 0;
 
     // Non-null opts this game into the data-only .gbamod package catalog.
@@ -174,6 +178,23 @@ struct RunOptions {
     // (the recorded trace already contains the composed keys).
     std::uint16_t (*input_frame)(const TouchFrameInfo* frame) = nullptr;
 
+    // Optional game-owned per-frame observer, called once per emulated frame
+    // at VBlank start on the guest thread (after input_frame when both are
+    // set). It may read guest memory but must not write it: achievement
+    // runtimes and similar watchers that need every frame, independent of
+    // presentation. Null installs nothing.
+    void (*vblank_frame)() = nullptr;
+
+    // Game-owned state that must travel with a savestate (an achievement
+    // runtime's partial progress, for instance). Called on the thread that
+    // wrote/read the state, with the guest stopped, after the engine's own
+    // state at `path` succeeded; the game keeps its data beside it (e.g.
+    // `path` + ".ra"). Covers save-state slots and the mobile suspend state.
+    // savestate_loaded(nullptr) reports an in-memory state (rewind), which
+    // has no file to pair with. Null installs nothing.
+    void (*savestate_written)(const char* path) = nullptr;
+    void (*savestate_loaded)(const char* path) = nullptr;
+
     // Gestures the game's policy owns (TouchClaim bits). An unclaimed
     // long-press still opens the runtime settings menu; a three-finger tap
     // always does.
@@ -259,6 +280,11 @@ struct RunOptions {
     // near-full-screen panels, larger hit targets, and touch-oriented footer
     // copy. False preserves the desktop/TV presentation for existing games.
     bool ui_touch_friendly = false;
+    // Runtime settings menu look: a recomp-ui theme name (nullptr: "gba") and
+    // a TrueType font, opened with SDL_RWFromFile (on Android a relative path
+    // is an APK asset); the built-in ImGui font when unset or unreadable.
+    const char* runtime_ui_theme = nullptr;
+    const char* runtime_ui_font = nullptr;
 
     // Game/device calibration beneath the user-facing gyro multiplier.
     // A menu value of 1.00x means this game's authored baseline; 0.75 here
@@ -295,6 +321,9 @@ struct RunOptions {
     // Lowercase SHA-1 of the only accepted patched output for a corpus built
     // against one translation release. Null leaves data-only patches open.
     const char* launcher_required_patch_sha1 = nullptr;
+    // With launcher_source_rom_sha1, also accept the already-patched target
+    // image (builtin_rom_sha1) without a patch; the stock source still needs one.
+    bool launcher_accept_patched_rom = false;
     // Keep an implemented extended-view mode out of the public launcher while
     // it is still being profiled. Explicit CLI/TOML opt-ins remain available.
     // Defaults true so existing games (including MMZ) retain today's UI.
