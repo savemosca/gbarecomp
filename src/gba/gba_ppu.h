@@ -166,6 +166,10 @@ public:
     // Active output dimensions = vanilla + active margins (== 240/160 when OFF).
     uint32_t render_width()  const { return kScreenWidth  + extra_left_ + extra_right_; }
     uint32_t render_height() const { return kScreenHeight + extra_top_ + extra_bottom_; }
+    // Where native (0, 0) sits in the expanded canvas: the left/top margins,
+    // or g_ws_native_view_left/top when a game places the native view itself.
+    uint32_t native_view_x() const;
+    uint32_t native_view_y() const;
     std::size_t render_bytes() const {
         return static_cast<std::size_t>(render_width()) * render_height() * 3;
     }
@@ -201,6 +205,21 @@ public:
     const uint8_t* latched_framebuffer() const { return latched_fb_.data(); }
     bool has_latched_framebuffer() const { return has_latched_fb_; }
 
+    // Host-only motion record for present-time frame interpolation, kept while
+    // g_ppu_record_motion is set (never serialized; empty otherwise). Each tag
+    // is the compositor key of the pixel's front layer: OBJ = priority*256 +
+    // OAM index, regular BG = priority*256 + 128 + layer, 0xFFFF = backdrop,
+    // 0xFFFE = anything else. Lines hold each visible line's scroll state.
+    struct MotionLine {
+        uint16_t dispcnt = 0;
+        uint16_t bgcnt[4] = {};
+        uint16_t hofs[4] = {};
+        uint16_t vofs[4] = {};
+    };
+    const uint16_t* latched_tags() const { return latched_tags_.empty() ? nullptr : latched_tags_.data(); }
+    const MotionLine* latched_motion_lines() const { return latched_lines_.empty() ? nullptr : latched_lines_.data(); }
+    const uint8_t* latched_oam() const { return latched_oam_.data(); }
+
 private:
     friend class SimulationStateCodec;
     std::unique_ptr<GbaHighResolutionFrame> high_resolution_;
@@ -226,6 +245,9 @@ private:
     std::vector<uint8_t> work_fb_ = std::vector<uint8_t>(kMaxFramebufferBytes);
     std::vector<uint8_t> latched_fb_ = std::vector<uint8_t>(kMaxFramebufferBytes);
     bool has_latched_fb_ = false;
+    std::vector<uint16_t> work_tags_, latched_tags_;      // allocated on first recorded line
+    std::vector<MotionLine> work_lines_, latched_lines_;
+    std::array<uint8_t, 1024> work_oam_{}, latched_oam_{};
 
     struct AffineLineState {
         int32_t x = 0;
@@ -288,6 +310,12 @@ extern "C" int g_ws_authored_margin_layers;
 // All BG, OBJ, window and authored-margin coordinates share this origin.
 // The native renderer ignores it; it is never serialized as guest state.
 extern "C" int g_ws_native_view_left;
+// The same for native Y=0, clamped to [0, render_height - 160]. Rows above
+// the native view render at scanline 0, rows below after its last line.
+extern "C" int g_ws_native_view_top;
+// Called as an expanded frame starts rendering (scanline 0), with the scroll
+// and VRAM state that frame shows: a game can place the native view here.
+extern "C" void (*g_ws_frame_start)();
 extern "C" int g_ws_pillarbox;  // Step C policy: black margins on non-field screens
 extern "C" int g_ws_pillarbox_left;
 extern "C" int g_ws_pillarbox_right;
@@ -316,6 +344,16 @@ extern "C" int (*g_ws_obj_attr_y_provider)(int oam_index,
 // providers above run first and may re-place known-safe sprites. Default 0
 // keeps the established expanded-viewport OBJ test.
 extern "C" int g_ws_obj_native_clip;
+
+// Present-time frame interpolation (host-only, default off). While
+// g_ppu_record_motion is nonzero the PPU keeps the motion record above. A
+// runtime with g_present_interpolator set calls it once per display refresh
+// with the newest finished frame and how far (0 <= t < 1) the moment shown
+// lies from the previous frame to it; returning nonzero means out2x now holds
+// that moment as a (2w x 2h RGB888) frame. Zero means no smooth motion now.
+extern "C" int g_ppu_record_motion;
+extern "C" int (*g_present_interpolator)(const GbaPpu* ppu, const uint8_t* rgb,
+                                         uint32_t w, uint32_t h, uint8_t* out2x, float t);
 
 // Read-only, game-authored OBJ coverage for expanded margins. RGB555 bit 15
 // marks a transparent pixel. Priority uses the hardware 0..3 BG/OBJ order.

@@ -588,11 +588,25 @@ uint32_t GbaIo::cycles_until_next_sio_event() const {
 void GbaIo::set_keyinput(uint16_t keys) {
     host_keyinput_ = static_cast<uint16_t>(keys & 0x03FFu);
     store_u16(&io_[IoReg::KEYINPUT], composed_keyinput());
+    update_keypad_irq();
 }
 
 void GbaIo::set_synthesized_keyinput(uint16_t keys) {
     synth_keyinput_ = static_cast<uint16_t>(keys & 0x03FFu);
     store_u16(&io_[IoReg::KEYINPUT], composed_keyinput());
+    update_keypad_irq();
+}
+
+void GbaIo::update_keypad_irq() {
+    const uint16_t cnt = load_u16(&io_[IoReg::KEYCNT]);
+    const uint16_t sel = cnt & 0x03FFu;
+    const uint16_t pressed = static_cast<uint16_t>(~composed_keyinput() & 0x03FFu);
+    bool cond = false;
+    if ((cnt & 0x4000u) && sel) {
+        cond = (cnt & 0x8000u) ? ((pressed & sel) == sel) : ((pressed & sel) != 0);
+    }
+    if (cond && !keypad_cond_) request_irq(IrqKeypad);
+    keypad_cond_ = cond;
 }
 
 bool GbaIo::irq_pending() const {
@@ -743,6 +757,12 @@ void GbaIo::write8(uint32_t off, uint8_t v) {
             // Read-only keypad state. BIOS init writes across broad
             // IO ranges; those writes must not make "all keys pressed."
             return;
+        case IoReg::KEYCNT:
+        case IoReg::KEYCNT + 1:
+            io_[off] = v;
+            keypad_cond_ = false;
+            update_keypad_irq();
+            return;
         case IoReg::IF:        // 0x202: low byte of IF
         case IoReg::IF + 1: {  // 0x203: high byte of IF
             // Byte-write to IF: write-1-to-clear within that byte
@@ -778,6 +798,11 @@ void GbaIo::write16_commit(uint32_t off, uint16_t v, bool record) {
             // Read-only on hardware.
             return;
         case IoReg::KEYINPUT:
+            return;
+        case IoReg::KEYCNT:
+            store_u16(&io_[off], v);
+            keypad_cond_ = false;   // re-evaluate against the new condition
+            update_keypad_irq();
             return;
         case IoReg::DISPSTAT: {
             // Bits 0..2 (VBlank/HBlank/VCount) are read-only; bits

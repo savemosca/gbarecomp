@@ -197,6 +197,9 @@ struct Args {
     bool sharp_filter = false;    // --sharp-filter 1: integer prescale + linear finish
     int internal_resolution = 1;
     bool internal_resolution_set = false;
+    // [video] integer_scale = true|false — default for whole-multiple
+    // presentation on Android (the in-game menu choice, once made, wins).
+    bool integer_scale = false;
     bool affine_filter = false;   // --affine-filter 1: game-authorized smoothing
     float gyro_sensitivity = 0.25f; // --gyro-sensitivity 0.25..4.00
     // [audio] shadow = true|false — arm the MP2K verified-enhancement shadow
@@ -293,6 +296,7 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_RESOLUTION_SCALE) == 0 && c->internal_resolution)
         *out = *c->internal_resolution;
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER) == 0) *out = c->window->linear_filter();
+    else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE) == 0) *out = c->window->integer_scale();
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_AUDIO) == 0) *out = c->window->audio_enabled();
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0) *out = c->window->volume();
     else if (std::strcmp(item->key, GBARECOMP_UI_KEY_STATE_SLOT) == 0) *out = c->state_slot;
@@ -306,6 +310,10 @@ int runtime_ui_get(void* opaque, const RecompRuntimeUiItem* item, int* out) {
     else if (std::strcmp(item->key,
                          GBARECOMP_UI_KEY_FAST_FORWARD_SPEED) == 0)
         *out = c->fast_forward_multiplier;
+    else if (std::strcmp(item->key, "gbarecomp.display.fill") == 0)
+        *out = c->window->fill_display();
+    else if (std::strcmp(item->key, "gbarecomp.touch.pad_visible") == 0)
+        *out = c->window->touch_pad_visible();
 #if defined(RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY)
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY) == 0 &&
              c->gyro_sensitivity)
@@ -329,6 +337,8 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
         *c->internal_resolution = std::clamp(value, 1, int(gba::GbaHighResolutionFrame::kMaxScale));
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_LINEAR_FILTER) == 0)
         c->window->set_linear_filter(value != 0);
+    else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_INTEGER_SCALE) == 0)
+        c->window->set_integer_scale(value != 0, /*persist=*/true);
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_AUDIO) == 0)
         c->window->set_audio_enabled(value != 0);
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_VOLUME) == 0)
@@ -349,6 +359,10 @@ int runtime_ui_set(void* opaque, const RecompRuntimeUiItem* item, int value) {
     else if (std::strcmp(item->key,
                          GBARECOMP_UI_KEY_FAST_FORWARD_SPEED) == 0)
         c->fast_forward_multiplier = std::clamp(value, 2, 10);
+    else if (std::strcmp(item->key, "gbarecomp.display.fill") == 0)
+        c->window->set_fill_display(value != 0);
+    else if (std::strcmp(item->key, "gbarecomp.touch.pad_visible") == 0)
+        c->window->set_touch_pad_visible(value != 0);
 #if defined(RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY)
     else if (std::strcmp(item->key, RECOMP_RUNTIME_UI_KEY_GYRO_SENSITIVITY) == 0 &&
              c->gyro_sensitivity)
@@ -810,6 +824,8 @@ bool apply_toml_file(const std::filesystem::path& path, Args* args,
                 return false;
             }
             args->internal_resolution = scale;
+        } else if (section == "video" && key == "integer_scale") {
+            args->integer_scale = (val == "true" || val == "1");
         } else if (section == "video" && key == "affine_filter") {
             args->affine_filter = (val == "true" || val == "1");
         } else if (section == "video" && key == "widescreen") {
@@ -1560,7 +1576,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         return 1;
     }
     std::string rom_sha1 = lower_ascii(gba::sha1(rom.data(), rom.size()).hex());
-    if (rom_sha1 != lower_ascii(args.rom_sha1)) {
+    if (opts.rom_post_load_hook &&
+        opts.rom_post_load_hook(rom.data(), rom.size(), rom_sha1.c_str()))
+        rom_sha1 = lower_ascii(gba::sha1(rom.data(), rom.size()).hex());
+    const std::string alt_sha1 = opts.alt_rom_sha1 ? lower_ascii(opts.alt_rom_sha1) : "";
+    if (!opts.allow_rom_sha1_mismatch && rom_sha1 != lower_ascii(args.rom_sha1) &&
+        (alt_sha1.empty() || rom_sha1 != alt_sha1)) {
         std::fprintf(stderr,
                      "[gbarecomp:runtime] ROM SHA-1 mismatch: got %s expected %s\n",
                      rom_sha1.c_str(), args.rom_sha1.c_str());
@@ -1712,6 +1733,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     g_force_interp = 0;
     if (const char* fi = std::getenv("GBARECOMP_FORCE_INTERP"))
         g_force_interp = (fi[0] && fi[0] != '0') ? 1 : 0;
+    // Never dispatch a different translation through this build's native corpus.
+    if (opts.allow_rom_sha1_mismatch && rom_sha1 != lower_ascii(opts.builtin_rom_sha1 ? opts.builtin_rom_sha1 : args.rom_sha1) &&
+        (alt_sha1.empty() || rom_sha1 != alt_sha1))
+        g_force_interp = 1;
     std::fprintf(stderr, "cpu_backend=%s\n",
                  g_force_interp ? "interpreter (GBARECOMP_FORCE_INTERP)"
                                 : "static-recompiled");
@@ -1918,7 +1943,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         bus.audio().shadow_hook_pcs(g_runtime_observed_pcs,
                                     RUNTIME_MAX_OBSERVED_PCS));
     g_runtime_dispatch_observer = g_runtime_observed_pc_count
-        ? [](uint32_t pc, int thumb) {
+        ? +[](uint32_t pc, int thumb) {  // + : GCC 11 won't pick a common type with nullptr
               if (gba::GbaBus* b = gbarecomp::active_bus())
                   b->audio().shadow_driver_tick(pc, thumb != 0);
           }
@@ -2293,6 +2318,12 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             uint32_t n = runtime_swi_log_save_file(sl);
             std::printf("swi_log_saved path=\"%s\" records=%u\n", sl, n);
         }
+        if (const char* ew = std::getenv("GBARECOMP_EWRAM_DUMP")) {
+            std::ofstream dump(ew, std::ios::binary | std::ios::trunc);
+            dump.write(reinterpret_cast<const char*>(bus.ewram_ptr()),
+                       256 * 1024);
+            std::printf("ewram_dump_saved path=\"%s\" ok=%d\n", ew, dump ? 1 : 0);
+        }
         if (const char* iw = std::getenv("GBARECOMP_IWRAM_DUMP")) {
             std::ofstream dump(iw, std::ios::binary | std::ios::trunc);
             dump.write(reinterpret_cast<const char*>(bus.iwram_ptr()),
@@ -2379,7 +2410,9 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     };
     auto do_savestate_save = [&](const std::string& path,
                                  std::string& e) -> bool {
-        return debug::save_state(path.c_str(), make_snapshot_ctx(), &e);
+        if (!debug::save_state(path.c_str(), make_snapshot_ctx(), &e)) return false;
+        if (opts.savestate_written) opts.savestate_written(path.c_str());
+        return true;
     };
     auto do_savestate_load = [&](const std::string& path,
                                  std::string& e) -> bool {
@@ -2407,6 +2440,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #if defined(GBARECOMP_WEB_HOST)
         bus.audio().discard_playback();
 #endif
+        if (opts.savestate_loaded) opts.savestate_loaded(path.c_str());
         return true;
     };
     auto do_savestate_save_bytes = [&](std::vector<uint8_t>& bytes,
@@ -2427,6 +2461,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
 #if defined(GBARECOMP_WEB_HOST)
         bus.audio().discard_playback();
 #endif
+        if (opts.savestate_loaded) opts.savestate_loaded(nullptr);
         return true;
     };
 
@@ -2664,11 +2699,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     if (opts.input_frame) {
         TouchHub::instance().set_claims(opts.touch_gesture_claims);
         publish_headless_touch_presentation();
-        runtime_set_vblank_input_hook(run_touch_policy);
         if (!args.quiet)
             std::printf("touch_policy=ENABLED claims=0x%x%s\n",
                         static_cast<unsigned>(opts.touch_gesture_claims),
                         touch_policy_suspended ? " (suspended: input replay)" : "");
+    }
+    if (opts.input_frame || opts.vblank_frame) {
+        runtime_set_vblank_input_hook([&run_touch_policy, &opts]() {
+            if (opts.input_frame) run_touch_policy();
+            if (opts.vblank_frame) opts.vblank_frame();
+        });
     }
     struct ClearVblankInputHook {
         ~ClearVblankInputHook() { runtime_set_vblank_input_hook(nullptr); }
@@ -2909,6 +2949,10 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         framedump_start = std::strtoull(e, nullptr, 0);
     if (const char* e = std::getenv("GBARECOMP_FRAMEDUMP_COUNT"))
         framedump_max = std::atoi(e);
+    // Optional sampling stride for long soak captures (default 1 = every frame).
+    uint64_t framedump_stride = 1;
+    if (const char* e = std::getenv("GBARECOMP_FRAMEDUMP_STRIDE"))
+        framedump_stride = std::max<uint64_t>(1, std::strtoull(e, nullptr, 0));
     // ── HP-002 frame-phase ring ─────────────────────────────────────────
     // Opt-in per-presented-frame breakdown of where wall time went
     // between consecutive presents: guest execution, view-sync + render/
@@ -2992,13 +3036,74 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
     };
     FramePhaseRing frame_phase;
     uint64_t high_resolution_presented = 0;
+    // Declared ahead of present_live_frame, which reads both.
+    // Wall-clock frame limiter — constructed only for windowed runs so
+    // the Windows timer-resolution bump doesn't apply to headless/TCP
+    // batch runs (which intentionally run uncapped).
+    std::optional<FramePacer> pacer;
+    bool fast_forward_active = false;
+    // Smooth motion: a game that installs gba::g_present_interpolator gets an
+    // interpolated frame on every display refresh between its real frames.
+    // Native presentation only; the high-resolution surface is presented as is.
+    std::vector<uint8_t> interpolated_fb;
+    // One present per display refresh, early in the refresh before the one it
+    // is for, so each lands in its own refresh. It shows the moment that far
+    // from the previous frame (fully shown at smooth_origin()) to this one. A
+    // refresh whose present would fall after the next frame's deadline, or
+    // that needs the next frame, is left for the next call.
+    std::chrono::steady_clock::time_point smooth_slot{};  // next refresh not yet presented
+    bool smooth_on = false;                               // the game's last answer
+    auto present_smooth = [&]() -> bool {
+        using clock = std::chrono::steady_clock;
+        const auto frame = pacer->period();
+        const clock::time_point origin = pacer->smooth_origin();
+        const clock::time_point deadline = pacer->frame_start() + frame;
+        interpolated_fb.resize(ppu.render_bytes() * 4u);
+        const uint32_t w = ppu.render_width(), h = ppu.render_height();
+        if (!smooth_on && !(smooth_on = gba::g_present_interpolator(&ppu, live_fb.data(), w, h,
+                                                                    interpolated_fb.data(), 0.5f) != 0))
+            return false;
+        std::chrono::nanoseconds refresh{};
+        clock::time_point vblank{};
+        if (!win.display_timing(&refresh, &vblank) || refresh < std::chrono::milliseconds(2))
+            refresh = frame / 2;
+        const clock::time_point now = clock::now();
+        if (vblank == clock::time_point{}) vblank = smooth_slot != clock::time_point{} ? smooth_slot : now;
+        clock::time_point slot = vblank + ((std::max(smooth_slot, now) - vblank) / refresh) * refresh;
+        while (slot <= now || slot < smooth_slot - refresh / 2) slot += refresh;
+        constexpr auto kEarly = std::chrono::milliseconds(1);
+        for (;; slot += refresh) {
+            const clock::time_point at = std::max(slot - refresh + kEarly, clock::now());
+            if (at > deadline || slot > origin + frame) break;
+            pacer->sleep_until(at);
+            if (clock::now() >= slot) continue;  // missed this refresh
+            const float t = std::chrono::duration<float>(slot - origin) / std::chrono::duration<float>(frame);
+            if (t >= 0.999f) {
+                win.present(live_fb.data());
+            } else if (gba::g_present_interpolator(&ppu, live_fb.data(), w, h, interpolated_fb.data(),
+                                                   std::max(t, 0.0f))) {
+                win.present_scaled(interpolated_fb.data(), 2);
+            } else {
+                smooth_on = false;
+                win.present(live_fb.data());
+                break;
+            }
+        }
+        smooth_slot = slot;
+        return true;
+    };
     auto present_live_frame = [&]() {
         ppu.set_internal_resolution(args.internal_resolution, opts.high_resolution_affine_provider);
         if (const auto* pixels = ppu.high_resolution_framebuffer()) {
             const auto* hd = ppu.high_resolution();
             win.present(pixels, hd->width(), hd->height());
             ++high_resolution_presented;
-        } else win.present(live_fb.data());
+            return;
+        }
+        if (gba::g_present_interpolator && pacer && !pacer->uncapped() && !fast_forward_active &&
+            present_smooth())
+            return;
+        win.present(live_fb.data());
     };
     auto apply_runtime_view_geometry = [&](ViewGeometry geometry) -> bool {
         if (opts.view_geometry) opts.view_geometry(&geometry, 0, 0);
@@ -3089,10 +3194,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         }
         return true;
     };
-    // Wall-clock frame limiter — constructed only for windowed runs so
-    // the Windows timer-resolution bump doesn't apply to headless/TCP
-    // batch runs (which intentionally run uncapped).
-    std::optional<FramePacer> pacer;
     // Windowed observe-mode TCP (see Args::tcp_observe_port). Savestate
     // requests from its thread are executed by the main loop at the next
     // present, the only point where machine state is consistent.
@@ -3182,6 +3283,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
             win.configure_touch(opts.input_frame != nullptr,
                                 opts.touch_gesture_claims,
                                 opts.touch_pad_default, args.touch_emulation);
+            win.set_integer_scale(args.integer_scale, /*persist=*/false);
             win.set_touch_config_dir(exe_dir.c_str());
             // The player's menu choice wins over [audio].shadow;
             // GBARECOMP_AUDIO_SHADOW still overrides both.
@@ -3232,6 +3334,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         }
         if (args.fullscreen) win.set_fullscreen(args.fullscreen);
         win.set_volume(args.volume);
+        win.set_menu_scancode(opts.runtime_menu_scancode);
         win.set_fps_readout(opts.show_fps_by_default);
 #if defined(GBARECOMP_RUNTIME_UI)
         runtime_ui_context.window = &win;
@@ -3263,7 +3366,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         RecompRuntimeUiStandardConfig runtime_ui_config{};
         runtime_ui_config.menu.title = runtime_title;
         runtime_ui_config.menu.subtitle = "Game Boy Advance runtime settings";
-        runtime_ui_config.menu.theme = "gba";
+        runtime_ui_config.menu.theme = opts.runtime_ui_theme ? opts.runtime_ui_theme : "gba";
 #if defined(RECOMP_RUNTIME_UI_HAS_PRESENTATION_FLAGS)
         if (opts.ui_touch_friendly) {
             runtime_ui_config.menu.presentation_flags |=
@@ -3308,15 +3411,16 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 RECOMP_RUNTIME_UI_STANDARD_SAVE_STATE |
                 RECOMP_RUNTIME_UI_STANDARD_LOAD_STATE;
         }
-        // INTEGER_SCALE is deliberately absent: HostWindow::adjust_scale only
+        // INTEGER_SCALE is absent on desktop: HostWindow::adjust_scale only
         // ever produces integer scales (clamped 1..8), so there is no
-        // fractional mode for a toggle to switch off. Offering one would
-        // advertise a choice the presentation path cannot make.
+        // fractional mode for a toggle to switch off. Android's full-screen
+        // layout does fill the display fractionally, so it offers the choice.
 #if !defined(__ANDROID__)
         runtime_ui_config.features |=
             RECOMP_RUNTIME_UI_STANDARD_FULLSCREEN |
             RECOMP_RUNTIME_UI_STANDARD_WINDOW_SCALE;
 #else
+        runtime_ui_config.features |= RECOMP_RUNTIME_UI_STANDARD_INTEGER_SCALE;
         // A mobile game has no window to close and the system Back button is
         // routed to the game, so the menu is the only clean way out: it ends
         // the session (save flushed, no suspend state) and the Activity
@@ -3446,6 +3550,32 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         fps_item.type        = RECOMP_RUNTIME_UI_BOOL;
         runtime_ui_extras.push_back(fps_item);
 
+#if defined(__ANDROID__)
+        RecompRuntimeUiItem fullscreen_item{};
+        fullscreen_item.key = RECOMP_RUNTIME_UI_KEY_FULLSCREEN;
+        fullscreen_item.section = "Display";
+        fullscreen_item.label = "Hide system bars";
+        fullscreen_item.description = "Hide Android system bars while playing.";
+        fullscreen_item.type = RECOMP_RUNTIME_UI_BOOL;
+        runtime_ui_extras.push_back(fullscreen_item);
+
+        RecompRuntimeUiItem fill_item{};
+        fill_item.key = "gbarecomp.display.fill";
+        fill_item.section = "Display";
+        fill_item.label = "Fill display (stretch)";
+        fill_item.description = "Stretch the original image to the display without repeating scenery.";
+        fill_item.type = RECOMP_RUNTIME_UI_BOOL;
+        runtime_ui_extras.push_back(fill_item);
+
+        RecompRuntimeUiItem touch_pad_item{};
+        touch_pad_item.key = "gbarecomp.touch.pad_visible";
+        touch_pad_item.section = "Display";
+        touch_pad_item.label = "On-screen buttons";
+        touch_pad_item.description = "Show or hide the touch gamepad overlay.";
+        touch_pad_item.type = RECOMP_RUNTIME_UI_BOOL;
+        runtime_ui_extras.push_back(touch_pad_item);
+#endif
+
         if (opts.ui_extra_items && opts.ui_extra_item_count) {
             const auto* game_items =
                 static_cast<const RecompRuntimeUiItem*>(opts.ui_extra_items);
@@ -3458,6 +3588,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         runtime_ui_context.ui =
             recomp_runtime_ui_create_standard(&runtime_ui_config);
         win.set_runtime_ui(runtime_ui_context.ui);
+        if (opts.runtime_ui_font) win.set_runtime_ui_font(opts.runtime_ui_font);
 #endif
         sync_resize_driven_view();
         if (live_fb.empty()) live_fb.assign(ppu.render_bytes(), 0);
@@ -3533,7 +3664,6 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
         return !opts.expose_assist_tools || win.assist_tools_enabled();
 #endif
     };
-    bool fast_forward_active = false;
     int fast_forward_multiplier = std::clamp(
         win.fast_forward_multiplier(), 2, 10);
     auto capture_rewind_point = [&]() {
@@ -4904,6 +5034,7 @@ int run_game(int argc, char** argv, const RunOptions& opts) {
                 if (present_frame) present_live_frame();
                 // Framedump (capture runs only) is attributed to present_us.
                 if (framedump_dir && frame >= framedump_start &&
+                    (frame - framedump_start) % framedump_stride == 0 &&
                     framedump_written < framedump_max) {
                     char p[512];
                     std::snprintf(p, sizeof(p), "%s/f_%06llu.png", framedump_dir,
