@@ -178,8 +178,11 @@ public:
     // (channels, FIFOs, master, soundbias, sample accumulator) plus the
     // pending host output ring so playback resumes seamlessly. The
     // diagnostic FIFO trace ring is NOT serialized. See debug/snapshot.h.
-    void serialize(gbarecomp::debug::SnapshotWriter& w) const;
-    void deserialize(gbarecomp::debug::SnapshotReader& r);
+    // with_psg34 = false is the layout before snapshot v5: PSG channels 3
+    // and 4, wave RAM and their panning were not saved, and load reset them
+    // (the driver re-triggers them within a frame).
+    void serialize(gbarecomp::debug::SnapshotWriter& w, bool with_psg34 = true) const;
+    void deserialize(gbarecomp::debug::SnapshotReader& r, bool with_psg34 = true);
 
 private:
     friend class SimulationStateCodec;

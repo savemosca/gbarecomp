@@ -356,6 +356,8 @@ void test_older_snapshots_rejected_before_restore() {
                catalog.register_provider(provider, &error), true);
     debug::SnapshotContext provider_context = context;
     provider_context.mod_state = &catalog;
+    // Versions 2 and 4 now load in their own layouts, so name an unsupported one.
+    patch_snapshot_version(v1_path, 1);
     bus.write8(0x02000000u, 0xbb);
     error.clear();
     check_bool("snapshot_legacy_v1", "provider catalog rejected",
@@ -457,11 +459,13 @@ void test_trailing_container_rejects_before_guest_mutation() {
     std::filesystem::remove(path, ec);
 }
 
-// Rewrites a current snapshot in the version-2 layout: the CPU section ends
-// before the SWI continuation count (which must be 0). `extra` appends that
-// many stray bytes to the section to check the framing still holds.
-bool write_swi_less_v2(const std::filesystem::path& from, const std::filesystem::path& to,
-                       uint32_t extra) {
+// Rewrites a current (v5) snapshot in an older layout: no TIME section, the
+// AUDIO payload replaced by `audio` (the pre-v5 layout of the same mixer),
+// and for version 2 the CPU section ending before the SWI continuation count
+// (which must be 0). `extra` appends that many stray bytes to the CPU section
+// to check the framing still holds.
+bool write_pre_timing(const std::filesystem::path& from, const std::filesystem::path& to,
+                      uint32_t version, const std::vector<uint8_t>& audio, uint32_t extra) {
     std::ifstream in(from, std::ios::binary);
     std::vector<char> d((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
     auto u32_at = [&d](std::size_t o) {
@@ -470,29 +474,51 @@ bool write_swi_less_v2(const std::filesystem::path& from, const std::filesystem:
                static_cast<uint32_t>(static_cast<uint8_t>(d[o + 2])) << 16 |
                static_cast<uint32_t>(static_cast<uint8_t>(d[o + 3])) << 24;
     };
-    auto put_u32 = [&d](std::size_t o, uint32_t v) {
-        for (int i = 0; i < 4; ++i) d[o + i] = static_cast<char>((v >> (8 * i)) & 0xffu);
+    auto put_u32 = [](std::vector<char>& v, uint32_t x) {
+        for (int i = 0; i < 4; ++i) v.push_back(static_cast<char>((x >> (8 * i)) & 0xffu));
     };
     if (d.size() < 52) return false;
     const uint32_t sections = u32_at(48);
+    std::vector<char> out(d.begin(), d.begin() + 52);
+    uint32_t kept = 0;
+    bool cpu_done = version != 2;
     std::size_t pos = 52;
     for (uint32_t i = 0; i < sections && pos + 8 <= d.size(); ++i) {
         const uint32_t size = u32_at(pos + 4);
-        if (std::memcmp(&d[pos], "CPU0", 4) == 0) {
-            const std::size_t count_at = pos + 8 + size - 4;
-            if (size < 4 || u32_at(count_at) != 0) return false;
-            d.erase(d.begin() + static_cast<std::ptrdiff_t>(count_at),
-                    d.begin() + static_cast<std::ptrdiff_t>(count_at + 4));
-            d.insert(d.begin() + static_cast<std::ptrdiff_t>(count_at), extra, '\0');
-            put_u32(pos + 4, size - 4 + extra);
-            put_u32(4, 2);
-            std::ofstream out(to, std::ios::binary | std::ios::trunc);
-            out.write(d.data(), static_cast<std::streamsize>(d.size()));
-            return static_cast<bool>(out);
-        }
+        const char* tag = &d[pos];
+        std::vector<char> body(d.begin() + static_cast<std::ptrdiff_t>(pos + 8),
+                               d.begin() + static_cast<std::ptrdiff_t>(pos + 8 + size));
         pos += 8 + size;
+        if (std::memcmp(tag, "TIME", 4) == 0) continue;
+        if (std::memcmp(tag, "AUD0", 4) == 0 || std::memcmp(tag, "AUDI", 4) == 0 ||
+            std::memcmp(tag, "APU0", 4) == 0) {
+            body.assign(audio.begin(), audio.end());
+        }
+        if (version == 2 && std::memcmp(tag, "CPU0", 4) == 0) {
+            if (body.size() < 4) return false;
+            const std::size_t count_at = body.size() - 4;
+            if (body[count_at] || body[count_at + 1] || body[count_at + 2] || body[count_at + 3]) return false;
+            body.resize(count_at);
+            body.insert(body.end(), extra, '\0');
+            cpu_done = true;
+        }
+        out.insert(out.end(), tag, tag + 4);
+        put_u32(out, static_cast<uint32_t>(body.size()));
+        out.insert(out.end(), body.begin(), body.end());
+        ++kept;
     }
-    return false;
+    if (!cpu_done) return false;
+    for (int i = 0; i < 4; ++i) out[4 + i] = static_cast<char>((version >> (8 * i)) & 0xffu);
+    for (int i = 0; i < 4; ++i) out[48 + i] = static_cast<char>((kept >> (8 * i)) & 0xffu);
+    std::ofstream o(to, std::ios::binary | std::ios::trunc);
+    o.write(out.data(), static_cast<std::streamsize>(out.size()));
+    return static_cast<bool>(o);
+}
+
+std::vector<uint8_t> pre_timing_audio(const gba::GbaBus& bus) {
+    gbarecomp::debug::SnapshotWriter w;
+    bus.audio().serialize(w, false);
+    return w.buffer();
 }
 
 void test_v2_swi_less_snapshot_loads() {
@@ -515,9 +541,10 @@ void test_v2_swi_less_snapshot_loads() {
     bus.write8(0x02000000u, 0x11);
     check_bool("snapshot_v2_swi_less", "write source",
                debug::save_state(source.string().c_str(), context, &error), true);
-    check_bool("snapshot_v2_swi_less", "rewrite as v2", write_swi_less_v2(source, v2, 0), true);
+    const auto audio = pre_timing_audio(bus);
+    check_bool("snapshot_v2_swi_less", "rewrite as v2", write_pre_timing(source, v2, 2, audio, 0), true);
     check_bool("snapshot_v2_swi_less", "rewrite as v2 with stray CPU bytes",
-               write_swi_less_v2(source, v2_stray, 4), true);
+               write_pre_timing(source, v2_stray, 2, audio, 4), true);
 
     // Suspend states and slots written before the SWI continuations existed
     // load with none pending.
@@ -537,6 +564,50 @@ void test_v2_swi_less_snapshot_loads() {
     std::filesystem::remove(source, ec);
     std::filesystem::remove(v2, ec);
     std::filesystem::remove(v2_stray, ec);
+}
+
+void test_v4_pre_timing_snapshot_loads() {
+    namespace debug = gbarecomp::debug;
+    const char* t = "snapshot_v4_pre_timing";
+    gba::GbaBus bus;
+    gba::GbaPpu ppu;
+    debug::ModStateRegistry empty_catalog;
+    debug::SnapshotContext context;
+    context.bus = &bus;
+    context.ppu = &ppu;
+    context.rom_sha1 = "0123456789012345678901234567890123456789";
+    context.mod_state = &empty_catalog;
+    std::string error;
+    std::error_code ec;
+    const auto dir = std::filesystem::temp_directory_path();
+    const auto source = dir / "gbarecomp-v4-source.gbas";
+    const auto v4 = dir / "gbarecomp-v4.gbas";
+    const auto v4_v5_audio = dir / "gbarecomp-v4-v5-audio.gbas";
+
+    bus.write8(0x02000000u, 0x11);
+    check_bool(t, "write source", debug::save_state(source.string().c_str(), context, &error), true);
+    check_bool(t, "rewrite as v4", write_pre_timing(source, v4, 4, pre_timing_audio(bus), 0), true);
+    gbarecomp::debug::SnapshotWriter current;
+    bus.audio().serialize(current, true);
+    check_bool(t, "rewrite as v4 with v5 audio",
+               write_pre_timing(source, v4_v5_audio, 4, current.buffer(), 0), true);
+
+    // Suspend states from the v4 runtimes load: no TIME section, PSG 3/4 reset.
+    bus.write8(0x02000000u, 0x22);
+    error.clear();
+    check_bool(t, "v4 loads", debug::load_state(v4.string().c_str(), context, &error), true);
+    check_eq(t, "guest restored", bus.read8(0x02000000u), 0x11u);
+
+    // A v4 file whose AUDIO has the v5 layout is refused before restoring.
+    bus.write8(0x02000000u, 0x33);
+    error.clear();
+    check_bool(t, "v5 audio in v4 rejected",
+               debug::load_state(v4_v5_audio.string().c_str(), context, &error), false);
+    check_eq(t, "rejection leaves guest", bus.read8(0x02000000u), 0x33u);
+
+    std::filesystem::remove(source, ec);
+    std::filesystem::remove(v4, ec);
+    std::filesystem::remove(v4_v5_audio, ec);
 }
 
 void test_sram_bus_width_and_region_mirroring() {
@@ -966,6 +1037,7 @@ int main() {
     test_snapshot_pending_timing();
     test_trailing_container_rejects_before_guest_mutation();
     test_v2_swi_less_snapshot_loads();
+    test_v4_pre_timing_snapshot_loads();
     test_sram_bus_width_and_region_mirroring();
     test_bios_undocumented_io_write();
     test_bios_window_writes_are_ignored();
