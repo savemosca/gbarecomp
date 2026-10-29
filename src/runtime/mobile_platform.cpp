@@ -6,6 +6,7 @@
 
 #include "mobile_platform.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +17,7 @@
 
 #if defined(__ANDROID__)
 #include <pthread.h>
+#include <sched.h>
 #include <unistd.h>
 
 #include <SDL.h>
@@ -44,7 +46,60 @@ struct StackedCall {
     std::size_t stack_bytes = 0;
     int result = 1;
 };
+// GBARECOMP_BIG_CORES=1 keeps the game thread on the performance cores, so
+// the scheduler cannot park the frame loop on a little core and drop frames
+// while the governor ramps up. A core counts as big when its scheduler
+// capacity (cpu_capacity: microarchitecture and clock) is at least 80% of the
+// strongest one. Clock alone is not enough: the Unisoc T820's Cortex-A55s run
+// at 81% of its fastest Cortex-A76 but have a third of its capacity. Kernels
+// without cpu_capacity fall back to cpuinfo_max_freq. No SoC table needed.
+long read_cpu_value(long cpu, const char* leaf) {
+    char path[96];
+    std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%ld/%s", cpu, leaf);
+    long value = 0;
+    if (std::FILE* f = std::fopen(path, "r")) {
+        if (std::fscanf(f, "%ld", &value) != 1) value = 0;
+        std::fclose(f);
+    }
+    return value;
+}
+
+void pin_to_big_cores() {
+    const char* env = std::getenv("GBARECOMP_BIG_CORES");
+    if (!env || !*env || *env == '0') return;
+    const long cpus = std::min<long>(sysconf(_SC_NPROCESSORS_CONF), CPU_SETSIZE);
+    const char* leaves[] = {"cpu_capacity", "cpufreq/cpuinfo_max_freq"};
+    for (const char* leaf : leaves) {
+        long score[CPU_SETSIZE] = {};
+        long top = 0;
+        bool complete = cpus > 0;
+        for (long cpu = 0; cpu < cpus; ++cpu) {
+            score[cpu] = read_cpu_value(cpu, leaf);
+            if (score[cpu] <= 0) complete = false;
+            top = std::max(top, score[cpu]);
+        }
+        // A partial read (offline cores) cannot rank the clusters reliably.
+        if (!complete || top <= 0) continue;
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        int picked = 0;
+        for (long cpu = 0; cpu < cpus; ++cpu) {
+            if (score[cpu] * 5 >= top * 4) {
+                CPU_SET(cpu, &set);
+                ++picked;
+            }
+        }
+        const bool ok = picked < cpus && sched_setaffinity(0, sizeof(set), &set) == 0;
+        std::fprintf(stderr, "mobile: game thread big-core affinity %s (%d of %ld cpus by %s)\n",
+                     ok ? "set" : (picked == cpus ? "unneeded" : "unavailable"), picked, cpus,
+                     leaf);
+        return;
+    }
+    std::fprintf(stderr, "mobile: game thread big-core affinity unavailable (no cpu topology)\n");
+}
+
 void* run_stacked(void* arg) {
+    pin_to_big_cores();
     auto* call = static_cast<StackedCall*>(arg);
     // Arm this thread's budget: keep kGuardMargin of headroom for the
     // runtime's own transient frames between two instruction-boundary

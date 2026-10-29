@@ -29,6 +29,9 @@ import java.nio.charset.StandardCharsets;
  * runtime so host chrome avoids cutouts and system-gesture edges.
  */
 public class GbaGameActivity extends SDLActivity {
+    private static final String DISPLAY_PREFERENCES = "display";
+    private static final String FULLSCREEN = "fullscreen";
+    private static volatile GbaGameActivity activeInstance;
     private GbaGameConfig config;
     private boolean nativeReady;
 
@@ -41,6 +44,7 @@ public class GbaGameActivity extends SDLActivity {
         } catch (IOException error) {
             throw new IllegalStateException("Unable to install game payload", error);
         }
+        activeInstance = this;
         super.onCreate(savedInstanceState);
         if (Build.VERSION.SDK_INT >= 28) {
             WindowManager.LayoutParams attributes = getWindow().getAttributes();
@@ -119,23 +123,72 @@ public class GbaGameActivity extends SDLActivity {
     }
 
     protected void enterImmersiveMode() {
+        applyFullscreen(getSharedPreferences(DISPLAY_PREFERENCES, MODE_PRIVATE)
+            .getBoolean(FULLSCREEN, true));
+    }
+
+    public void setTouchPadVisibleFromNative(boolean visible) {
+        getSharedPreferences("touch", MODE_PRIVATE).edit()
+            .putBoolean("pad_visible", visible).apply();
+    }
+
+    public boolean fillDisplayPreferenceFromNative() {
+        return getSharedPreferences(DISPLAY_PREFERENCES, MODE_PRIVATE)
+            .getBoolean("fill_display", false);
+    }
+
+    public void setFillDisplayFromNative(boolean enabled) {
+        getSharedPreferences(DISPLAY_PREFERENCES, MODE_PRIVATE).edit()
+            .putBoolean("fill_display", enabled).apply();
+    }
+
+    public boolean fullscreenPreferenceFromNative() {
+        return getSharedPreferences(DISPLAY_PREFERENCES, MODE_PRIVATE)
+            .getBoolean(FULLSCREEN, true);
+    }
+
+    public void setImmersiveMode(boolean fullscreen) {
+        getSharedPreferences(DISPLAY_PREFERENCES, MODE_PRIVATE).edit()
+            .putBoolean(FULLSCREEN, fullscreen).apply();
+        runOnUiThread(() -> applyFullscreen(fullscreen));
+    }
+
+    private void applyFullscreen(boolean fullscreen) {
+        mFullscreenModeActive = fullscreen;
+        if (fullscreen) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FORCE_NOT_FULLSCREEN);
+        } else {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_FORCE_NOT_FULLSCREEN);
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_FULLSCREEN);
+        }
         if (Build.VERSION.SDK_INT >= 30) {
+            // Hidden bars alone leave the window inset by them (1920x940 on a
+            // 1920x1080 handheld); the game must lay out under them too.
+            getWindow().setDecorFitsSystemWindows(!fullscreen);
             WindowInsetsController controller = getWindow().getInsetsController();
             if (controller != null) {
-                controller.hide(WindowInsets.Type.statusBars()
-                    | WindowInsets.Type.navigationBars());
+                int bars = WindowInsets.Type.statusBars() | WindowInsets.Type.navigationBars();
+                if (fullscreen) controller.hide(bars);
+                else controller.show(bars);
                 controller.setSystemBarsBehavior(
                     WindowInsetsController.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
             }
         } else {
-            getWindow().getDecorView().setSystemUiVisibility(
+            getWindow().getDecorView().setSystemUiVisibility(fullscreen ?
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
                     | View.SYSTEM_UI_FLAG_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_HIDE_NAVIGATION
                     | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN
                     | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION
-                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
+                    | View.SYSTEM_UI_FLAG_LAYOUT_STABLE : View.SYSTEM_UI_FLAG_LAYOUT_STABLE);
         }
+    }
+
+    @Override
+    protected void onDestroy() {
+        if (activeInstance == this) activeInstance = null;
+        super.onDestroy();
     }
 
     /**

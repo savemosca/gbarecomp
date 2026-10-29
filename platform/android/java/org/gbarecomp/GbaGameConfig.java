@@ -19,6 +19,7 @@ public final class GbaGameConfig {
     public final String[] romSha1;
     public final long romSize;
     public final String romFile;
+    public final String romPatchSourceSha1;
     public final boolean biosRequired;
     public final String biosSha1;
     public final String orientation;   // landscape | landscape-locked | portrait | any
@@ -33,6 +34,8 @@ public final class GbaGameConfig {
         romSha1 = shas.isEmpty() ? new String[0] : shas.toLowerCase(Locale.US).split(",");
         romSize = Long.parseLong(string(m, "gbarecomp.rom_size", "0"));
         romFile = string(m, "gbarecomp.rom_file", "game.gba");
+        romPatchSourceSha1 = string(m, "gbarecomp.rom_patch_source_sha1", "")
+            .toLowerCase(Locale.US);
         biosRequired = Boolean.parseBoolean(string(m, "gbarecomp.bios_required", "false"));
         biosSha1 = string(m, "gbarecomp.bios_sha1",
             "300c20df6731a33952ded8c436f7f186d25d3492").toLowerCase(Locale.US);

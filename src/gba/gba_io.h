@@ -208,9 +208,13 @@ public:
     // Both default to 0x03FF, so a game without a policy sees exactly the
     // host keys, as before.
     void set_keyinput(uint16_t keys);
+    // KEYCNT keypad interrupt (GBATEK "Keypad Input"): request IRQ 12 when
+    // the enabled condition becomes true. Also wakes HALT/STOP via IF.
+    void update_keypad_irq();
     void set_synthesized_keyinput(uint16_t keys);
     uint16_t host_keyinput() const { return host_keyinput_; }
     uint16_t synthesized_keyinput() const { return synth_keyinput_; }
+    bool keypad_cond_ = false;
     uint16_t composed_keyinput() const {
         return static_cast<uint16_t>(host_keyinput_ & synth_keyinput_ & 0x03FFu);
     }
