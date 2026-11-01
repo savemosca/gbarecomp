@@ -543,7 +543,7 @@ struct Backend {
     int          fullscreen = 0;        // 0 windowed, 1 borderless, 2 exclusive
     int          volume = 100;          // 0..100 gain on pushed samples
     std::vector<int16_t> volume_buf;    // scratch for gain != 100
-    // FPS readout (DisplayPerf hotkey): presents/sec in the title bar.
+    // FPS readout (DisplayPerf hotkey): presents/sec in the title bar and on screen.
     bool         fps_readout = false;
     double       fps_value = 0.0;   // last readout, also drawn on screen
     std::string  title;                 // base window title (readout restores it)
@@ -1488,10 +1488,6 @@ bool runtime_menu_open(const Backend* b) {
 }
 #endif
 
-// Host chrome drawn over the game image, in order: the game's host overlay,
-// the virtual pad and its toggle, the engine long-press cue, then (runtime UI
-// builds) the settings menu on top. Nothing here reads or writes guest state
-// except through the game's own overlay callback.
 // Show FPS: the readout in a corner of the screen, for full-screen and
 // handheld play where there is no title bar to carry it.
 void draw_fps(Backend* b, HostOverlay& ov) {
@@ -1510,6 +1506,10 @@ void draw_fps(Backend* b, HostOverlay& ov) {
             OverlaySpace::Drawable);
 }
 
+// Host chrome drawn over the game image, in order: the game's host overlay,
+// the virtual pad and its toggle, the engine long-press cue, then (runtime UI
+// builds) the settings menu on top. Nothing here reads or writes guest state
+// except through the game's own overlay callback.
 void draw_host_chrome(Backend* b, HostOverlay& ov, bool menu_open) {
     if (menu_open) return;
     draw_fps(b, ov);
